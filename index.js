@@ -9,6 +9,9 @@ app.use(cors());
 const PORT = process.env.PORT || 7000;
 const TORBOX_API = 'https://api.torbox.app/v1/api';
 
+// URL padrão já pré-configurada com trackers brasileiros e filtro de idioma Português
+const DEFAULT_PTBR_INDEXER = 'https://torrentio.strem.fun/providers=comando,bludv,lapumia,micoleaodublado,nyaasi,tokyotosho|language=portuguese';
+
 function decodeConfig(configStr) {
     try {
         return JSON.parse(Buffer.from(configStr, 'base64url').toString('utf8'));
@@ -19,10 +22,10 @@ function decodeConfig(configStr) {
 
 function buildManifest(hasApiKey = false) {
     return {
-        id: 'org.community.torbox.AllInOne',
-        version: '1.0.0',
-        name: hasApiKey ? 'TorBox Streamer (Debrid)' : 'TorBox Streamer (Configurar)',
-        description: 'Addon Stremio para Filmes, Séries e Animes com suporte a cache da API TorBox.',
+        id: 'org.community.torbox.ptbr',
+        version: '1.1.0',
+        name: hasApiKey ? 'TorBox PT-BR 🇧🇷' : 'TorBox PT-BR (Configurar)',
+        description: 'Filmes, Séries e Animes exclusivamente em Português (PT-BR) via TorBox API.',
         resources: ['stream'],
         types: ['movie', 'series', 'anime'],
         idPrefixes: ['tt', 'kitsu'],
@@ -32,6 +35,21 @@ function buildManifest(hasApiKey = false) {
             configurationRequired: !hasApiKey
         }
     };
+}
+
+// Verifica se o título/descrição do torrent possui indicadores de Português (PT-BR)
+function isPtBrStream(text, onlyDubbed = false) {
+    if (!text) return false;
+
+    if (onlyDubbed) {
+        // Exige estritamente Dublado, Dual Áudio ou Áudio Nacional
+        const dubRegex = /(🇧🇷|\bdublado\b|\bdub\b|\bdual[-_. ]?audio\b|\bdual\b|\bnacional\b|\baudio\s*pt\b|\bpt[-_. ]?br\s*dub\b)/i;
+        return dubRegex.test(text);
+    }
+
+    // Aceita Dublado, Dual Áudio, PT-BR ou Legendado em Português
+    const ptbrRegex = /(🇧🇷|\bpt[-_. ]?br\b|\bportugues(e)?\b|\bportuguês\b|\bdublado\b|\bdub\b|\bdual[-_. ]?audio\b|\bdual\b|\bnacional\b|\blegendado\b|\bleg\s*pt\b|\bbrazil(ian)?\b)/i;
+    return ptbrRegex.test(text);
 }
 
 async function getMediaMetadata(type, idPrefix, rawId) {
@@ -73,7 +91,7 @@ async function checkTorBoxCache(apiKey, hashes) {
     }
 }
 
-async function searchUserTorBoxCloud(apiKey, queryTitle) {
+async function searchUserTorBoxCloud(apiKey, queryTitle, onlyDubbed) {
     if (!apiKey || !queryTitle) return [];
     try {
         const res = await axios.get(`${TORBOX_API}/torrents/mylist`, {
@@ -84,10 +102,13 @@ async function searchUserTorBoxCloud(apiKey, queryTitle) {
         const list = res.data?.data || [];
         const normalizedQuery = queryTitle.toLowerCase();
         return list
-            .filter(item => item.download_present && item.name.toLowerCase().includes(normalizedQuery))
+            .filter(item => {
+                const matchesTitle = item.download_present && item.name.toLowerCase().includes(normalizedQuery);
+                return matchesTitle && isPtBrStream(item.name, onlyDubbed);
+            })
             .map(item => ({
                 infoHash: item.hash.toLowerCase(),
-                title: item.name,
+                title: `🇧🇷 ${item.name}`,
                 size: item.size,
                 source: 'TorBox Cloud'
             }));
@@ -96,34 +117,36 @@ async function searchUserTorBoxCloud(apiKey, queryTitle) {
     }
 }
 
-async function fetchCandidateTorrents(type, id, customIndexerUrl, apiKey, metadata) {
+async function fetchCandidateTorrents(type, id, customIndexerUrl, apiKey, metadata, onlyDubbed) {
     const results = [];
 
+    // 1. Busca na nuvem pessoal do TorBox (filtrando por PT-BR)
     if (metadata.title) {
-        const cloudItems = await searchUserTorBoxCloud(apiKey, metadata.title);
+        const cloudItems = await searchUserTorBoxCloud(apiKey, metadata.title, onlyDubbed);
         results.push(...cloudItems);
     }
 
-    if (customIndexerUrl) {
-        try {
-            const cleanBase = customIndexerUrl.replace(/\/$/, '');
-            const url = `${cleanBase}/stream/${type}/${encodeURIComponent(id)}.json`;
-            const res = await axios.get(url, { timeout: 8000 });
-            const streams = res.data?.streams || [];
+    // 2. Consulta o indexador com filtro de provedores brasileiros
+    const baseUrl = (customIndexerUrl || DEFAULT_PTBR_INDEXER).replace(/\/$/, '');
+    try {
+        const url = `${baseUrl}/stream/${type}/${encodeURIComponent(id)}.json`;
+        const res = await axios.get(url, { timeout: 8000 });
+        const streams = res.data?.streams || [];
 
-            for (const s of streams) {
-                if (s.infoHash) {
-                    results.push({
-                        infoHash: s.infoHash.toLowerCase(),
-                        title: s.title || s.description || s.name || 'Stream',
-                        fileIdx: s.fileIdx ?? null,
-                        source: s.name || 'Indexer'
-                    });
-                }
+        for (const s of streams) {
+            const fullText = `${s.name || ''} ${s.title || ''} ${s.description || ''}`;
+            // Trava PT-BR: só adiciona o torrent se passar no filtro de português
+            if (s.infoHash && isPtBrStream(fullText, onlyDubbed)) {
+                results.push({
+                    infoHash: s.infoHash.toLowerCase(),
+                    title: s.title || s.description || s.name || 'Stream PT-BR',
+                    fileIdx: s.fileIdx ?? null,
+                    source: s.name || 'Indexer PT-BR'
+                });
             }
-        } catch (err) {
-            console.error('Erro no indexador externo:', err.message);
         }
+    } catch (err) {
+        console.error('Erro no indexador externo:', err.message);
     }
 
     const unique = new Map();
@@ -158,44 +181,51 @@ app.get(['/', '/configure', '/:config/configure'], (req, res) => {
     <html lang="pt-BR">
     <head>
         <meta charset="UTF-8">
-        <title>Configurar TorBox Stremio Addon</title>
+        <title>Configurar TorBox PT-BR</title>
         <style>
             body { font-family: system-ui, sans-serif; background: #0f172a; color: #f8fafc; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
-            .card { background: #1e293b; padding: 2rem; border-radius: 12px; width: 100%; max-width: 440px; box-shadow: 0 10px 25px rgba(0,0,0,0.4); }
-            h2 { margin-top: 0; color: #38bdf8; }
+            .card { background: #1e293b; padding: 2rem; border-radius: 12px; width: 100%; max-width: 460px; box-shadow: 0 10px 25px rgba(0,0,0,0.4); }
+            h2 { margin-top: 0; color: #4ade80; }
             label { display: block; margin-top: 1rem; font-size: 0.9rem; color: #cbd5e1; }
-            input { width: 100%; padding: 0.75rem; margin-top: 0.4rem; border-radius: 8px; border: 1px solid #334155; background: #0f172a; color: #fff; box-sizing: border-box; }
-            button { width: 100%; margin-top: 1.5rem; padding: 0.85rem; background: #0284c7; color: white; border: none; border-radius: 8px; font-size: 1rem; font-weight: bold; cursor: pointer; }
-            button:hover { background: #0369a1; }
+            input[type="text"], input[type="password"] { width: 100%; padding: 0.75rem; margin-top: 0.4rem; border-radius: 8px; border: 1px solid #334155; background: #0f172a; color: #fff; box-sizing: border-box; }
+            .checkbox-label { display: flex; align-items: center; gap: 8px; margin-top: 0.8rem; cursor: pointer; }
+            button { width: 100%; margin-top: 1.5rem; padding: 0.85rem; background: #16a34a; color: white; border: none; border-radius: 8px; font-size: 1rem; font-weight: bold; cursor: pointer; }
+            button:hover { background: #15803d; }
             .hint { font-size: 0.8rem; color: #94a3b8; margin-top: 0.3rem; }
         </style>
     </head>
     <body>
         <div class="card">
-            <h2>⚡ TorBox Addon</h2>
-            <p class="hint">Filmes, Séries e Animes via TorBox API ou P2P.</p>
+            <h2>🇧🇷 TorBox PT-BR Addon</h2>
+            <p class="hint">Busca exclusiva de Filmes, Séries e Animes em Português.</p>
             
-            <label>TorBox API Key (Opcional para P2P, Obrigatório para Cache):</label>
+            <label>TorBox API Key:</label>
             <input type="password" id="apiKey" placeholder="Cole sua chave da conta TorBox..." />
             
-            <label>URL de Indexador Upstream:</label>
-            <input type="text" id="indexerUrl" placeholder="https://torrentio.strem.fun" value="https://torrentio.strem.fun" />
-            <div class="hint">Fonte de hashes para filmes, séries (IMDb) e animes (Kitsu).</div>
+            <label>Indexador Upstream (Já configurado para PT-BR):</label>
+            <input type="text" id="indexerUrl" value="${DEFAULT_PTBR_INDEXER}" />
+            <div class="hint">Inclui Comando, BluDV, Lapumia, Mico Leão Dublado e Nyaa PT-BR.</div>
 
-            <label style="margin-top: 1rem;">
-                <input type="checkbox" id="cachedOnly" style="width: auto; margin-right: 6px;" checked />
+            <label class="checkbox-label">
+                <input type="checkbox" id="onlyDubbed" />
+                Apenas Dublado / Dual Áudio (Ignorar apenas legendados)
+            </label>
+
+            <label class="checkbox-label">
+                <input type="checkbox" id="cachedOnly" checked />
                 Mostrar apenas streams em cache instantâneo ([TB+])
             </label>
 
-            <button onclick="install()">Instalar no Stremio</button>
+            <button onclick="install()">Instalar Addon PT-BR no Stremio</button>
         </div>
         <script>
             function install() {
                 const apiKey = document.getElementById('apiKey').value.trim();
                 const indexerUrl = document.getElementById('indexerUrl').value.trim();
+                const onlyDubbed = document.getElementById('onlyDubbed').checked;
                 const cachedOnly = document.getElementById('cachedOnly').checked;
                 
-                const config = { apiKey, indexerUrl, cachedOnly };
+                const config = { apiKey, indexerUrl, onlyDubbed, cachedOnly };
                 const encoded = btoa(JSON.stringify(config)).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, '');
                 const stremioUrl = 'stremio://' + window.location.host + '/' + encoded + '/manifest.json';
                 window.location.href = stremioUrl;
@@ -235,7 +265,14 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
     }
 
     const metadata = await getMediaMetadata(type, idPrefix, id);
-    const candidates = await fetchCandidateTorrents(type, id, config.indexerUrl, config.apiKey, metadata);
+    const candidates = await fetchCandidateTorrents(
+        type,
+        id,
+        config.indexerUrl,
+        config.apiKey,
+        metadata,
+        Boolean(config.onlyDubbed)
+    );
 
     if (!candidates.length) {
         return res.json({ streams: [] });
@@ -243,7 +280,7 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
 
     if (!config.apiKey) {
         const p2pStreams = candidates.map(c => ({
-            name: 'P2P Torrent',
+            name: '🇧🇷 P2P PT-BR',
             title: c.title,
             infoHash: c.infoHash,
             ...(c.fileIdx !== null ? { fileIdx: c.fileIdx } : {})
@@ -260,7 +297,7 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
         const isCached = Boolean(cachedMap[item.infoHash]);
         if (config.cachedOnly && !isCached) continue;
 
-        const badge = isCached ? '⚡ [TB+]' : '⏳ [TB Download]';
+        const badge = isCached ? '⚡ [TB+ 🇧🇷]' : '⏳ [TB Download 🇧🇷]';
         const resolveUrl = `${host}/${configStr}/resolve/${item.infoHash}/${season ?? 0}/${episode ?? 0}`;
 
         streams.push({
@@ -268,7 +305,7 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
             title: item.title,
             url: resolveUrl,
             behaviorHints: {
-                bingeGroup: `torbox-${isCached ? 'cached' : 'uncached'}`
+                bingeGroup: `torbox-ptbr-${isCached ? 'cached' : 'uncached'}`
             }
         });
     }
@@ -305,7 +342,7 @@ app.get('/:config/resolve/:infoHash/:season/:episode', async (req, res) => {
         }
 
         const listRes = await axios.get(`${TORBOX_API}/torrents/mylist`, {
-            headers: { Authorization: `Bearer ${config.apiKey}` },
+            headers: { Authorization: `Bearer ${apiKey}` },
             params: { id: torrentId, bypass_cache: true },
             timeout: 10000
         });
