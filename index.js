@@ -9,7 +9,6 @@ app.use(cors());
 const PORT = process.env.PORT || 7000;
 const TORBOX_API = 'https://api.torbox.app/v1/api';
 
-// Trackers públicos para acelerar o carregamento quando usado SEM TorBox (Modo P2P)
 const PUBLIC_TRACKERS = [
     'dht:6881',
     'tracker:udp://tracker.opentrackr.org:1337/announce',
@@ -20,7 +19,6 @@ const PUBLIC_TRACKERS = [
     'tracker:http://tracker.openbittorrent.com:80/announce'
 ];
 
-// Indexadores consultados simultaneamente
 const DEFAULT_INDEXERS = [
     {
         name: 'Torrentio PT-BR',
@@ -38,10 +36,6 @@ const DEFAULT_INDEXERS = [
         isNativePtBr: false
     }
 ];
-
-// ==========================================
-// 1. UTILITÁRIOS DE CONFIGURAÇÃO E MANIFESTO
-// ==========================================
 
 function decodeConfig(configStr) {
     if (!configStr) return { mode: 'p2p' };
@@ -61,7 +55,7 @@ function buildManifest(config = {}) {
 
     return {
         id: 'org.community.torbox.ptbr.pro',
-        version: '2.1.0',
+        version: '2.2.0',
         name: addonName,
         description: 'Catálogos e Streams de Filmes, Séries e Animes em PT-BR (4K/1080p/720p) com opção P2P Gratuito ou API TorBox.',
         resources: ['catalog', 'stream'],
@@ -89,14 +83,10 @@ function buildManifest(config = {}) {
         ],
         behaviorHints: {
             configurable: true,
-            configurationRequired: false // Permite usar sem configurar nada (vai direto para o P2P)
+            configurationRequired: false
         }
     };
 }
-
-// ==========================================
-// 2. FILTROS PT-BR E ORDENAÇÃO DE QUALIDADE
-// ==========================================
 
 function isPtBrStream(text, onlyDubbed = false, isNativePtBrSource = false) {
     if (!text) return false;
@@ -147,10 +137,6 @@ function extractInfoHash(streamObj) {
     const match = rawText.match(/\b([a-fA-F0-9]{40})\b/);
     return match ? match[1].toLowerCase() : null;
 }
-
-// ==========================================
-// 3. CATÁLOGOS EM PORTUGUÊS (FILMES, SÉRIES, ANIMES)
-// ==========================================
 
 async function fetchAnimesCatalog(searchQuery = '', skip = 0) {
     try {
@@ -228,10 +214,6 @@ async function fetchMoviesOrSeriesCatalog(type, searchQuery = '', skip = 0, tmdb
         return [];
     }
 }
-
-// ==========================================
-// 4. INTEGRAÇÃO COM TORBOX E MÚLTIPLOS INDEXADORES
-// ==========================================
 
 async function getMediaMetadata(type, idPrefix, rawId) {
     try {
@@ -380,20 +362,17 @@ function selectBestVideoFile(files, season, episode) {
     return videoFiles.reduce((prev, curr) => (curr.size > prev.size ? curr : prev), videoFiles[0]);
 }
 
-// ==========================================
-// 5. PÁGINA DE CONFIGURAÇÃO INTERATIVA
-// ==========================================
-
+// Página de Configuração com Link Direto, Botão de Copiar e Stremio Web
 app.get(['/', '/configure', '/:config/configure'], (req, res) => {
     res.send(`
     <!DOCTYPE html>
     <html lang="pt-BR">
     <head>
         <meta charset="UTF-8">
-        <title>Stremio PT-BR Addon (P2P & TorBox)</title>
+        <title>Stremio PT-BR Pro 2.2</title>
         <style>
             body { font-family: system-ui, sans-serif; background: #0f172a; color: #f8fafc; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 1rem; }
-            .card { background: #1e293b; padding: 2rem; border-radius: 12px; width: 100%; max-width: 490px; box-shadow: 0 10px 25px rgba(0,0,0,0.4); }
+            .card { background: #1e293b; padding: 2rem; border-radius: 12px; width: 100%; max-width: 500px; box-shadow: 0 10px 25px rgba(0,0,0,0.4); }
             h2 { margin-top: 0; color: #4ade80; }
             .badges { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 1rem; }
             .badge { background: #334155; color: #38bdf8; padding: 4px 8px; border-radius: 6px; font-size: 0.75rem; font-weight: bold; }
@@ -401,14 +380,20 @@ app.get(['/', '/configure', '/:config/configure'], (req, res) => {
             select, input[type="text"], input[type="password"] { width: 100%; padding: 0.75rem; margin-top: 0.4rem; border-radius: 8px; border: 1px solid #334155; background: #0f172a; color: #fff; box-sizing: border-box; font-size: 0.95rem; }
             .torbox-box { background: #0f172a80; border: 1px solid #334155; padding: 1rem; border-radius: 8px; margin-top: 1rem; }
             .checkbox-label { display: flex; align-items: center; gap: 8px; margin-top: 0.8rem; cursor: pointer; font-size: 0.9rem; font-weight: normal; }
-            button { width: 100%; margin-top: 1.5rem; padding: 0.85rem; background: #16a34a; color: white; border: none; border-radius: 8px; font-size: 1rem; font-weight: bold; cursor: pointer; }
-            button:hover { background: #15803d; }
+            .btn { display: block; text-align: center; text-decoration: none; width: 100%; margin-top: 1.2rem; padding: 0.85rem; border: none; border-radius: 8px; font-size: 1rem; font-weight: bold; cursor: pointer; box-sizing: border-box; }
+            .btn-green { background: #16a34a; color: white; }
+            .btn-green:hover { background: #15803d; }
+            .btn-blue { background: #0284c7; color: white; margin-top: 0.6rem; }
+            .btn-blue:hover { background: #0369a1; }
+            .btn-dark { background: #334155; color: #f8fafc; margin-top: 0.6rem; font-size: 0.9rem; }
+            .btn-dark:hover { background: #475569; }
+            .url-box { margin-top: 1rem; padding: 0.6rem; background: #0f172a; border: 1px dashed #475569; border-radius: 8px; font-size: 0.75rem; word-break: break-all; color: #94a3b8; }
             .hint { font-size: 0.78rem; color: #94a3b8; margin-top: 0.3rem; }
         </style>
     </head>
     <body>
         <div class="card">
-            <h2>🇧🇷 Stremio PT-BR Pro 2.1</h2>
+            <h2>🇧🇷 Stremio PT-BR Pro 2.2</h2>
             <div class="badges">
                 <span class="badge">Modo Sem TorBox (P2P)</span>
                 <span class="badge">Modo TorBox API</span>
@@ -417,7 +402,7 @@ app.get(['/', '/configure', '/:config/configure'], (req, res) => {
             </div>
             
             <label>Como você deseja assistir?</label>
-            <select id="mode" onchange="toggleMode()">
+            <select id="mode" onchange="updateLinks()">
                 <option value="p2p">🌐 Sem API TorBox (Modo P2P Torrent Gratuito)</option>
                 <option value="torbox">⚡ Usar API do TorBox (Cache Instantâneo Debrid)</option>
                 <option value="hybrid">🔀 Modo Híbrido (Mostrar links TorBox + links P2P)</option>
@@ -425,62 +410,78 @@ app.get(['/', '/configure', '/:config/configure'], (req, res) => {
 
             <div id="torboxSection" class="torbox-box" style="display: none;">
                 <label style="margin-top: 0;">TorBox API Key:</label>
-                <input type="password" id="apiKey" placeholder="Cole sua chave da conta TorBox..." />
+                <input type="password" id="apiKey" placeholder="Cole sua chave da conta TorBox..." oninput="updateLinks()" />
                 
                 <label class="checkbox-label">
-                    <input type="checkbox" id="cachedOnly" checked />
+                    <input type="checkbox" id="cachedOnly" checked onchange="updateLinks()" />
                     Mostrar apenas streams em cache instantâneo ([TB+])
                 </label>
             </div>
             
             <label>TMDB API Key (Opcional - Traduz capas e sinopses para PT-BR):</label>
-            <input type="text" id="tmdbKey" placeholder="Opcional: deixe em branco para usar catálogo padrão" />
+            <input type="text" id="tmdbKey" placeholder="Opcional: deixe em branco para usar catálogo padrão" oninput="updateLinks()" />
 
             <label>Indexadores Extras Opcionais (separados por vírgula):</label>
-            <input type="text" id="customIndexers" placeholder="Opcional: Torrentio, Brazuca e MediaFusion já inclusos" />
-            <div class="hint">Torrentio PT-BR, Brazuca Torrents e MediaFusion já vêm ativados por padrão.</div>
+            <input type="text" id="customIndexers" placeholder="Opcional: Torrentio, Brazuca e MediaFusion já inclusos" oninput="updateLinks()" />
 
             <label class="checkbox-label">
-                <input type="checkbox" id="onlyDubbed" />
+                <input type="checkbox" id="onlyDubbed" onchange="updateLinks()" />
                 Apenas Dublado / Dual Áudio (Ocultar apenas legendados)
             </label>
 
-            <button onclick="install()">Instalar no Stremio</button>
+            <a id="installAppBtn" class="btn btn-green" href="#">🚀 Abrir e Instalar no Stremio</a>
+            <button type="button" class="btn btn-blue" onclick="copyManifestUrl()" id="copyBtn">📋 Copiar Link (Para colar no Stremio)</button>
+            <a id="installWebBtn" class="btn btn-dark" href="#" target="_blank">🌐 Instalar pelo Stremio Web</a>
+
+            <div class="url-box" id="manifestUrlDisplay"></div>
         </div>
         <script>
-            function toggleMode() {
+            let currentHttpUrl = '';
+
+            function updateLinks() {
                 const mode = document.getElementById('mode').value;
                 const tbSection = document.getElementById('torboxSection');
                 tbSection.style.display = (mode === 'p2p') ? 'none' : 'block';
-            }
 
-            function install() {
-                const mode = document.getElementById('mode').value;
                 const apiKey = mode === 'p2p' ? '' : document.getElementById('apiKey').value.trim();
                 const tmdbKey = document.getElementById('tmdbKey').value.trim();
                 const indexerUrl = document.getElementById('customIndexers').value.trim();
                 const onlyDubbed = document.getElementById('onlyDubbed').checked;
                 const cachedOnly = document.getElementById('cachedOnly').checked;
 
-                if ((mode === 'torbox' || mode === 'hybrid') && !apiKey) {
-                    alert('Por favor, insira sua TorBox API Key ou mude a opção acima para "Sem API TorBox (Modo P2P)".');
-                    return;
-                }
-                
                 const config = { mode, apiKey, tmdbKey, indexerUrl, onlyDubbed, cachedOnly };
-                const encoded = btoa(JSON.stringify(config)).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, '');
-                const stremioUrl = 'stremio://' + window.location.host + '/' + encoded + '/manifest.json';
-                window.location.href = stremioUrl;
+                const encoded = btoa(JSON.stringify(config))
+                    .replaceAll('+', '-')
+                    .replaceAll('/', '_')
+                    .replaceAll('=', '');
+
+                const host = window.location.host;
+                const protocol = window.location.protocol;
+                currentHttpUrl = protocol + '//' + host + '/' + encoded + '/manifest.json';
+                const stremioDeepLink = 'stremio://' + host + '/' + encoded + '/manifest.json';
+                const stremioWebLink = 'https://web.stremio.com/#/addons?addon=' + encodeURIComponent(currentHttpUrl);
+
+                document.getElementById('installAppBtn').href = stremioDeepLink;
+                document.getElementById('installWebBtn').href = stremioWebLink;
+                document.getElementById('manifestUrlDisplay').textContent = 'Link do Manifesto: ' + currentHttpUrl;
             }
+
+            function copyManifestUrl() {
+                navigator.clipboard.writeText(currentHttpUrl).then(() => {
+                    const btn = document.getElementById('copyBtn');
+                    btn.textContent = '✅ Link Copiado! Cole na aba Addons do Stremio';
+                    setTimeout(() => {
+                        btn.textContent = '📋 Copiar Link (Para colar no Stremio)';
+                    }, 3500);
+                });
+            }
+
+            updateLinks();
         </script>
     </body>
     </html>
     `);
 });
-
-// ==========================================
-// 6. ROTAS DO STREMIO (COM E SEM CONFIGURAÇÃO)
-// ==========================================
 
 app.get('/manifest.json', (req, res) => {
     res.json(buildManifest({ mode: 'p2p' }));
@@ -491,7 +492,6 @@ app.get('/:config/manifest.json', (req, res) => {
     res.json(buildManifest(config));
 });
 
-// Rotas de Catálogo (funcionam tanto com /:config quanto direto na raiz)
 async function handleCatalogRequest(req, res) {
     const { config: configStr, type, extra } = req.params;
     const config = decodeConfig(configStr);
@@ -522,7 +522,6 @@ app.get([
     '/:config/catalog/:type/:id/:extra.json'
 ], handleCatalogRequest);
 
-// Rotas de Stream (Suporta Modo P2P, Modo TorBox e Modo Híbrido)
 async function handleStreamRequest(req, res) {
     const { config: configStr, type, id } = req.params;
     const config = decodeConfig(configStr);
@@ -562,7 +561,6 @@ async function handleStreamRequest(req, res) {
 
     const scoredStreams = [];
 
-    // 1. Se o modo for TorBox ou Híbrido (e tiver API Key), gera os streams via TorBox
     if ((mode === 'torbox' || mode === 'hybrid') && activeApiKey) {
         const hashes = candidates.map(c => c.infoHash);
         const cachedMap = await checkTorBoxCache(activeApiKey, hashes);
@@ -591,7 +589,6 @@ async function handleStreamRequest(req, res) {
         }
     }
 
-    // 2. Se o modo for P2P (Sem API TorBox) ou Híbrido, gera os streams Torrent Direto
     if (mode === 'p2p' || mode === 'hybrid' || !activeApiKey) {
         for (const c of candidates) {
             const q = analyzeQuality(c.title);
@@ -611,7 +608,6 @@ async function handleStreamRequest(req, res) {
         }
     }
 
-    // Ordena por pontuação (TorBox Cache 4K -> 1080p -> P2P 4K -> 1080p -> 720p)
     scoredStreams.sort((a, b) => b._score - a._score);
 
     const finalStreams = scoredStreams.map(({ _score, ...stream }) => stream);
@@ -623,7 +619,6 @@ app.get([
     '/:config/stream/:type/:id.json'
 ], handleStreamRequest);
 
-// Resolvedor On-Demand do TorBox
 app.get('/:config/resolve/:infoHash/:season/:episode', async (req, res) => {
     const { config: configStr, infoHash, season, episode } = req.params;
     const config = decodeConfig(configStr);
@@ -653,7 +648,7 @@ app.get('/:config/resolve/:infoHash/:season/:episode', async (req, res) => {
         }
 
         const listRes = await axios.get(`${TORBOX_API}/torrents/mylist`, {
-            headers: { Authorization: `Bearer ${config.apiKey}` },
+            headers: { Authorization: `Bearer ${apiKey}` },
             params: { id: torrentId, bypass_cache: true },
             timeout: 10000
         });
