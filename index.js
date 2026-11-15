@@ -6,6 +6,12 @@ const FormData = require('form-data');
 const app = express();
 app.use(cors());
 
+// Remove barras duplicadas (ex: //manifest.json) que causam erro 404
+app.use((req, res, next) => {
+    req.url = req.url.replace(/\/+/g, '/');
+    next();
+});
+
 const PORT = process.env.PORT || 7000;
 const TORBOX_API = 'https://api.torbox.app/v1/api';
 
@@ -38,9 +44,10 @@ const DEFAULT_INDEXERS = [
 ];
 
 function decodeConfig(configStr) {
-    if (!configStr) return { mode: 'p2p' };
+    if (!configStr || configStr === 'configure') return { mode: 'p2p' };
     try {
-        return JSON.parse(Buffer.from(configStr, 'base64url').toString('utf8'));
+        const b64 = configStr.replace(/-/g, '+').replace(/_/g, '/');
+        return JSON.parse(Buffer.from(b64, 'base64').toString('utf8'));
     } catch {
         return { mode: 'p2p' };
     }
@@ -55,7 +62,7 @@ function buildManifest(config = {}) {
 
     return {
         id: 'org.community.torbox.ptbr.pro',
-        version: '2.2.0',
+        version: '2.3.0',
         name: addonName,
         description: 'Catálogos e Streams de Filmes, Séries e Animes em PT-BR (4K/1080p/720p) com opção P2P Gratuito ou API TorBox.',
         resources: ['catalog', 'stream'],
@@ -90,14 +97,9 @@ function buildManifest(config = {}) {
 
 function isPtBrStream(text, onlyDubbed = false, isNativePtBrSource = false) {
     if (!text) return false;
-
     const dubRegex = /(🇧🇷|\bdublado\b|\bdub\b|\bdual[-_. ]?audio\b|\bdual\b|\bnacional\b|\baudio\s*pt\b|\bpt[-_. ]?br\s*dub\b)/i;
-    if (onlyDubbed) {
-        return dubRegex.test(text);
-    }
-
+    if (onlyDubbed) return dubRegex.test(text);
     if (isNativePtBrSource) return true;
-
     const ptbrRegex = /(🇧🇷|\bpt[-_. ]?br\b|\bportugues(e)?\b|\bportuguês\b|\bdublado\b|\bdub\b|\bdual[-_. ]?audio\b|\bdual\b|\bnacional\b|\blegendado\b|\bleg\s*pt\b|\bbrazil(ian)?\b)/i;
     return ptbrRegex.test(text);
 }
@@ -123,7 +125,6 @@ function analyzeQuality(title = '') {
 
     const isDub = /(\bdublado\b|\bdub\b|\bdual\b|\bnacional\b)/i.test(t);
     if (isDub) score += 50;
-
     if (/\b(hdr|dv|dolby\s*vision|hevc|x265|10bit)\b/i.test(t)) score += 15;
 
     return { resolution, score, isDub };
@@ -140,15 +141,9 @@ function extractInfoHash(streamObj) {
 
 async function fetchAnimesCatalog(searchQuery = '', skip = 0) {
     try {
-        const params = {
-            'page[limit]': 20,
-            'page[offset]': skip
-        };
-        if (searchQuery) {
-            params['filter[text]'] = searchQuery;
-        } else {
-            params['sort'] = '-userCount';
-        }
+        const params = { 'page[limit]': 20, 'page[offset]': skip };
+        if (searchQuery) params['filter[text]'] = searchQuery;
+        else params['sort'] = '-userCount';
 
         const res = await axios.get('https://kitsu.io/api/edge/anime', { params, timeout: 7000 });
         const items = res.data?.data || [];
@@ -179,7 +174,7 @@ async function fetchMoviesOrSeriesCatalog(type, searchQuery = '', skip = 0, tmdb
         const metas = (res.data?.metas || []).slice(0, 20);
 
         if (tmdbKey) {
-            const translated = await Promise.all(
+            return await Promise.all(
                 metas.map(async (meta) => {
                     try {
                         const imdbId = meta.id.split(':')[0];
@@ -206,9 +201,7 @@ async function fetchMoviesOrSeriesCatalog(type, searchQuery = '', skip = 0, tmdb
                     return meta;
                 })
             );
-            return translated;
         }
-
         return metas;
     } catch {
         return [];
@@ -299,8 +292,8 @@ async function fetchCandidateTorrents(type, id, customIndexerUrls, apiKey, metad
     }
 
     const queryTypes = id.startsWith('kitsu') ? ['anime', 'series'] : [type];
-
     const requests = [];
+
     for (const indexer of activeIndexers) {
         const cleanBase = indexer.url.replace(/\/$/, '');
         for (const qType of queryTypes) {
@@ -362,14 +355,14 @@ function selectBestVideoFile(files, season, episode) {
     return videoFiles.reduce((prev, curr) => (curr.size > prev.size ? curr : prev), videoFiles[0]);
 }
 
-// Página de Configuração com Link Direto, Botão de Copiar e Stremio Web
+// Página de Configuração
 app.get(['/', '/configure', '/:config/configure'], (req, res) => {
     res.send(`
     <!DOCTYPE html>
     <html lang="pt-BR">
     <head>
         <meta charset="UTF-8">
-        <title>Stremio PT-BR Pro 2.2</title>
+        <title>Stremio PT-BR Pro 2.3</title>
         <style>
             body { font-family: system-ui, sans-serif; background: #0f172a; color: #f8fafc; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 1rem; }
             .card { background: #1e293b; padding: 2rem; border-radius: 12px; width: 100%; max-width: 500px; box-shadow: 0 10px 25px rgba(0,0,0,0.4); }
@@ -385,15 +378,12 @@ app.get(['/', '/configure', '/:config/configure'], (req, res) => {
             .btn-green:hover { background: #15803d; }
             .btn-blue { background: #0284c7; color: white; margin-top: 0.6rem; }
             .btn-blue:hover { background: #0369a1; }
-            .btn-dark { background: #334155; color: #f8fafc; margin-top: 0.6rem; font-size: 0.9rem; }
-            .btn-dark:hover { background: #475569; }
             .url-box { margin-top: 1rem; padding: 0.6rem; background: #0f172a; border: 1px dashed #475569; border-radius: 8px; font-size: 0.75rem; word-break: break-all; color: #94a3b8; }
-            .hint { font-size: 0.78rem; color: #94a3b8; margin-top: 0.3rem; }
         </style>
     </head>
     <body>
         <div class="card">
-            <h2>🇧🇷 Stremio PT-BR Pro 2.2</h2>
+            <h2>🇧🇷 Stremio PT-BR Pro 2.3</h2>
             <div class="badges">
                 <span class="badge">Modo Sem TorBox (P2P)</span>
                 <span class="badge">Modo TorBox API</span>
@@ -430,8 +420,7 @@ app.get(['/', '/configure', '/:config/configure'], (req, res) => {
             </label>
 
             <a id="installAppBtn" class="btn btn-green" href="#">🚀 Abrir e Instalar no Stremio</a>
-            <button type="button" class="btn btn-blue" onclick="copyManifestUrl()" id="copyBtn">📋 Copiar Link (Para colar no Stremio)</button>
-            <a id="installWebBtn" class="btn btn-dark" href="#" target="_blank">🌐 Instalar pelo Stremio Web</a>
+            <button type="button" class="btn btn-blue" onclick="copyManifestUrl()" id="copyBtn">📋 Copiar Link do Manifesto</button>
 
             <div class="url-box" id="manifestUrlDisplay"></div>
         </div>
@@ -451,28 +440,26 @@ app.get(['/', '/configure', '/:config/configure'], (req, res) => {
 
                 const config = { mode, apiKey, tmdbKey, indexerUrl, onlyDubbed, cachedOnly };
                 const encoded = btoa(JSON.stringify(config))
-                    .replaceAll('+', '-')
-                    .replaceAll('/', '_')
-                    .replaceAll('=', '');
+                    .replace(/\\+/g, '-')
+                    .replace(/\\//g, '_')
+                    .replace(/=+$/, '');
 
                 const host = window.location.host;
                 const protocol = window.location.protocol;
                 currentHttpUrl = protocol + '//' + host + '/' + encoded + '/manifest.json';
                 const stremioDeepLink = 'stremio://' + host + '/' + encoded + '/manifest.json';
-                const stremioWebLink = 'https://web.stremio.com/#/addons?addon=' + encodeURIComponent(currentHttpUrl);
 
                 document.getElementById('installAppBtn').href = stremioDeepLink;
-                document.getElementById('installWebBtn').href = stremioWebLink;
-                document.getElementById('manifestUrlDisplay').textContent = 'Link do Manifesto: ' + currentHttpUrl;
+                document.getElementById('manifestUrlDisplay').textContent = currentHttpUrl;
             }
 
             function copyManifestUrl() {
                 navigator.clipboard.writeText(currentHttpUrl).then(() => {
                     const btn = document.getElementById('copyBtn');
-                    btn.textContent = '✅ Link Copiado! Cole na aba Addons do Stremio';
+                    btn.textContent = '✅ Link Copiado!';
                     setTimeout(() => {
-                        btn.textContent = '📋 Copiar Link (Para colar no Stremio)';
-                    }, 3500);
+                        btn.textContent = '📋 Copiar Link do Manifesto';
+                    }, 3000);
                 });
             }
 
@@ -483,12 +470,11 @@ app.get(['/', '/configure', '/:config/configure'], (req, res) => {
     `);
 });
 
-app.get('/manifest.json', (req, res) => {
-    res.json(buildManifest({ mode: 'p2p' }));
-});
-
-app.get('/:config/manifest.json', (req, res) => {
-    const config = decodeConfig(req.params.config);
+// Rota universal de Manifesto (nunca dá 404 em subpastas)
+app.get(['/manifest.json', '/:config/manifest.json', '/*/manifest.json'], (req, res) => {
+    const parts = req.path.split('/').filter(Boolean);
+    const configSeg = parts.length > 1 ? parts[parts.length - 2] : (req.query.config || '');
+    const config = decodeConfig(configSeg);
     res.json(buildManifest(config));
 });
 
@@ -575,7 +561,7 @@ async function handleStreamRequest(req, res) {
 
             const badge = isCached ? '⚡ [TB+ 🇧🇷]' : '⏳ [TB 🇧🇷]';
             const audioTag = q.isDub ? '🎙️ Dub/Dual' : '💬 PT-BR';
-            const resolveUrl = `${host}/${configStr}/resolve/${item.infoHash}/${season ?? 0}/${episode ?? 0}`;
+            const resolveUrl = `${host}/${configStr || 'p2p'}/resolve/${item.infoHash}/${season ?? 0}/${episode ?? 0}`;
 
             scoredStreams.push({
                 name: `${badge} ${q.resolution}\n${audioTag}`,
