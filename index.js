@@ -15,7 +15,82 @@ app.use((req, res, next) => {
 const PORT = process.env.PORT || 7000;
 const TORBOX_API = 'https://api.torbox.app/v1/api';
 
-// Histórico em memória para a fileira "Continue Assistindo"
+// =========================================================
+// TRADUTOR AUTOMÁTICO PT-BR COM CACHE EM MEMÓRIA
+// =========================================================
+
+const translationCache = new Map();
+
+const GENRE_TRANSLATIONS = {
+    'Action': 'Ação',
+    'Adventure': 'Aventura',
+    'Animation': 'Animação',
+    'Biography': 'Biografia',
+    'Comedy': 'Comédia',
+    'Crime': 'Crime',
+    'Documentary': 'Documentário',
+    'Drama': 'Drama',
+    'Family': 'Família',
+    'Fantasy': 'Fantasia',
+    'Film-Noir': 'Noir',
+    'History': 'História',
+    'Horror': 'Terror',
+    'Music': 'Música',
+    'Musical': 'Musical',
+    'Mystery': 'Mistério',
+    'Romance': 'Romance',
+    'Sci-Fi': 'Ficção Científica',
+    'Science Fiction': 'Ficção Científica',
+    'Short': 'Curta',
+    'Sport': 'Esporte',
+    'Thriller': 'Suspense',
+    'War': 'Guerra',
+    'Western': 'Faroeste'
+};
+
+function translateGenresToPtBr(genres = []) {
+    if (!Array.isArray(genres)) return [];
+    return genres.map(g => GENRE_TRANSLATIONS[g] || g);
+}
+
+async function translateToPtBr(text) {
+    if (!text || typeof text !== 'string') return '';
+    const cleanText = text.replace(/\s*\[Written by [^\]]+\]\s*/gi, '').trim();
+    if (!cleanText) return '';
+
+    if (translationCache.has(cleanText)) {
+        return translationCache.get(cleanText);
+    }
+
+    try {
+        const res = await axios.get('https://translate.googleapis.com/translate_a/single', {
+            params: {
+                client: 'gtx',
+                sl: 'auto',
+                tl: 'pt',
+                dt: 't',
+                q: cleanText
+            },
+            timeout: 4000
+        });
+
+        if (Array.isArray(res.data?.[0])) {
+            const translated = res.data[0].map(part => part[0]).join('');
+            if (translated) {
+                if (translationCache.size > 2000) translationCache.clear();
+                translationCache.set(cleanText, translated);
+                return translated;
+            }
+        }
+    } catch {}
+
+    return cleanText;
+}
+
+// =========================================================
+// HISTÓRICO "CONTINUE ASSISTINDO"
+// =========================================================
+
 const recentlyWatched = {
     movie: [],
     series: []
@@ -102,10 +177,9 @@ function buildManifest(config = {}) {
 
     return {
         id: 'org.community.torbox.ptbr.pro',
-        version: '3.1.0',
+        version: '3.2.0',
         name: addonName,
-        description: 'Catálogos, Metadados (Filmes, Séries e Animes) e Streams em PT-BR com TorBox e P2P.',
-        // Agora 'meta' está ativo para todos os tipos (movie, series, anime) e prefixos (tt, kitsu)
+        description: 'Catálogos, Sinopses em Português (Filmes, Séries e Animes) e Streams em PT-BR com TorBox e P2P.',
         resources: ['catalog', 'meta', 'stream'],
         types: ['movie', 'series', 'anime'],
         idPrefixes: ['tt', 'kitsu'],
@@ -273,7 +347,7 @@ function extractInfoHash(streamObj) {
 }
 
 // =========================================================
-// MOTOR DE CATÁLOGOS E METADADOS COMPLETOS (FILMES, SÉRIES, ANIMES)
+// CATÁLOGOS E METADADOS COM SINOPSES 100% EM PORTUGUÊS
 // =========================================================
 
 async function fetchAnimesCatalog(searchQuery = '', skip = 0) {
@@ -285,24 +359,27 @@ async function fetchAnimesCatalog(searchQuery = '', skip = 0) {
         const res = await axios.get('https://kitsu.io/api/edge/anime', { params, timeout: 7000 });
         const items = res.data?.data || [];
 
-        return items.map(item => {
-            const attr = item.attributes || {};
-            return {
-                id: `kitsu:${item.id}`,
-                type: 'anime',
-                name: attr.titles?.pt_br || attr.titles?.en || attr.canonicalTitle || 'Anime',
-                poster: attr.posterImage?.medium || attr.posterImage?.original || '',
-                background: attr.coverImage?.original || attr.posterImage?.original || '',
-                description: attr.synopsis || '',
-                releaseInfo: attr.startDate ? attr.startDate.split('-')[0] : ''
-            };
-        });
+        return await Promise.all(
+            items.map(async (item) => {
+                const attr = item.attributes || {};
+                const ptSynopsis = await translateToPtBr(attr.synopsis || '');
+                return {
+                    id: `kitsu:${item.id}`,
+                    type: 'anime',
+                    name: attr.titles?.pt_br || attr.titles?.en || attr.canonicalTitle || 'Anime',
+                    poster: attr.posterImage?.medium || attr.posterImage?.original || '',
+                    background: attr.coverImage?.original || attr.posterImage?.original || '',
+                    description: ptSynopsis,
+                    releaseInfo: attr.startDate ? attr.startDate.split('-')[0] : ''
+                };
+            })
+        );
     } catch {
         return [];
     }
 }
 
-// Carrega metadados e lista de episódios para Animes (Kitsu)
+// Metadados completos de Animes com sinopse e episódios em Português
 async function fetchAnimeMeta(kitsuId, requestedType = 'anime') {
     try {
         const [animeRes, epRes] = await Promise.all([
@@ -313,26 +390,29 @@ async function fetchAnimeMeta(kitsuId, requestedType = 'anime') {
         const attr = animeRes.data?.data?.attributes || {};
         const episodes = epRes.data?.data || [];
 
+        const ptSynopsis = await translateToPtBr(attr.synopsis || '');
+
         const videos = episodes.map((ep, idx) => {
             const epAttr = ep.attributes || {};
             const epNum = epAttr.number || (idx + 1);
             return {
                 id: `kitsu:${kitsuId}:${epNum}`,
-                title: epAttr.canonicalTitle || `Episódio ${epNum}`,
+                title: `Episódio ${epNum}${epAttr.canonicalTitle ? ` - ${epAttr.canonicalTitle}` : ''}`,
                 season: 1,
                 episode: epNum,
+                overview: ptSynopsis,
                 released: epAttr.airdate ? new Date(epAttr.airdate).toISOString() : new Date().toISOString(),
                 thumbnail: epAttr.thumbnail?.original || attr.posterImage?.medium || ''
             };
         });
 
-        // Se o anime for filme único ou ainda não tiver lista detalhada, cria o item de reprodução
         if (videos.length === 0) {
             videos.push({
                 id: `kitsu:${kitsuId}:1`,
-                title: attr.canonicalTitle || 'Episódio 1',
+                title: 'Episódio 1',
                 season: 1,
                 episode: 1,
+                overview: ptSynopsis,
                 released: new Date().toISOString()
             });
         }
@@ -343,7 +423,7 @@ async function fetchAnimeMeta(kitsuId, requestedType = 'anime') {
             name: attr.titles?.pt_br || attr.titles?.en || attr.canonicalTitle || 'Anime',
             poster: attr.posterImage?.large || attr.posterImage?.original || '',
             background: attr.coverImage?.original || attr.posterImage?.original || '',
-            description: attr.synopsis || '',
+            description: ptSynopsis,
             releaseInfo: attr.startDate ? attr.startDate.split('-')[0] : '',
             imdbRating: attr.averageRating ? (parseFloat(attr.averageRating) / 10).toFixed(1) : undefined,
             videos
@@ -353,7 +433,7 @@ async function fetchAnimeMeta(kitsuId, requestedType = 'anime') {
     }
 }
 
-// Carrega metadados completos (sinopse, fundo, temporadas e episódios) para Filmes e Séries (IMDb tt...)
+// Metadados completos de Filmes e Séries (IMDb) traduzidos para PT-BR
 async function fetchImdbMeta(type, imdbId, tmdbKey = '') {
     const cleanId = imdbId.split(':')[0];
     const metaType = type === 'movie' ? 'movie' : 'series';
@@ -364,14 +444,16 @@ async function fetchImdbMeta(type, imdbId, tmdbKey = '') {
 
         if (!meta) return null;
 
-        // Se o usuário configurou TMDB Key, traduz o título, capa e sinopse para PT-BR
+        let isTranslatedByTmdb = false;
+
+        // 1. Se tiver TMDB Key configurada, tenta buscar título, capa e sinopse oficial PT-BR
         if (tmdbKey) {
             try {
                 const findRes = await axios.get(
                     `https://api.themoviedb.org/3/find/${cleanId}`,
                     {
                         params: { api_key: tmdbKey, external_source: 'imdb_id', language: 'pt-BR' },
-                        timeout: 4000
+                        timeout: 3500
                     }
                 );
                 const match = metaType === 'movie'
@@ -380,16 +462,31 @@ async function fetchImdbMeta(type, imdbId, tmdbKey = '') {
 
                 if (match) {
                     meta.name = match.title || match.name || meta.name;
-                    if (match.overview) meta.description = match.overview;
+                    if (match.overview) {
+                        meta.description = match.overview;
+                        isTranslatedByTmdb = true;
+                    }
                     if (match.poster_path) meta.poster = `https://image.tmdb.org/t/p/w500${match.poster_path}`;
                     if (match.backdrop_path) meta.background = `https://image.tmdb.org/t/p/original${match.backdrop_path}`;
                 }
             } catch {}
         }
 
+        // 2. Se não usou TMDB (ou se o TMDB não tinha sinopse em português), traduz automaticamente!
+        if (!isTranslatedByTmdb && meta.description) {
+            meta.description = await translateToPtBr(meta.description);
+        }
+
+        // 3. Traduz os gêneros (Action -> Ação, Horror -> Terror, etc.)
+        if (meta.genres) {
+            meta.genres = translateGenresToPtBr(meta.genres);
+        }
+        if (meta.genre) {
+            meta.genre = translateGenresToPtBr(meta.genre);
+        }
+
         return meta;
     } catch {
-        // Fallback básico para nunca falhar ao abrir a tela do filme/série
         return {
             id: cleanId,
             type: metaType,
@@ -420,18 +517,22 @@ async function fetchMoviesOrSeriesCatalog(type, catalogId, extraObj = {}, tmdbKe
         const url = `https://v3-cinemeta.strem.io/catalog/${type}/${feedType}${extraSuffix}`;
 
         const res = await axios.get(url, { timeout: 7500 });
-        const metas = (res.data?.metas || []).slice(0, 24);
+        const metas = (res.data?.metas || []).slice(0, 20);
 
-        if (tmdbKey && metas.length > 0) {
-            return await Promise.all(
-                metas.map(async (meta) => {
+        // Traduz sinopses e gêneros de todos os itens do catálogo para PT-BR em paralelo
+        return await Promise.all(
+            metas.map(async (meta) => {
+                let updatedMeta = { ...meta };
+                let translatedByTmdb = false;
+
+                if (tmdbKey) {
                     try {
                         const imdbId = meta.id.split(':')[0];
                         const findRes = await axios.get(
                             `https://api.themoviedb.org/3/find/${imdbId}`,
                             {
                                 params: { api_key: tmdbKey, external_source: 'imdb_id', language: 'pt-BR' },
-                                timeout: 3500
+                                timeout: 3000
                             }
                         );
                         const match = type === 'movie'
@@ -439,20 +540,27 @@ async function fetchMoviesOrSeriesCatalog(type, catalogId, extraObj = {}, tmdbKe
                             : findRes.data?.tv_results?.[0];
 
                         if (match) {
-                            return {
-                                ...meta,
-                                name: match.title || match.name || meta.name,
-                                poster: match.poster_path ? `https://image.tmdb.org/t/p/w500${match.poster_path}` : meta.poster,
-                                description: match.overview || meta.description
-                            };
+                            updatedMeta.name = match.title || match.name || meta.name;
+                            if (match.poster_path) updatedMeta.poster = `https://image.tmdb.org/t/p/w500${match.poster_path}`;
+                            if (match.overview) {
+                                updatedMeta.description = match.overview;
+                                translatedByTmdb = true;
+                            }
                         }
                     } catch {}
-                    return meta;
-                })
-            );
-        }
+                }
 
-        return metas;
+                if (!translatedByTmdb && updatedMeta.description) {
+                    updatedMeta.description = await translateToPtBr(updatedMeta.description);
+                }
+
+                if (updatedMeta.genres) {
+                    updatedMeta.genres = translateGenresToPtBr(updatedMeta.genres);
+                }
+
+                return updatedMeta;
+            })
+        );
     } catch (err) {
         console.error('Erro ao buscar catálogo:', err.message);
         return [];
@@ -477,13 +585,14 @@ async function getMediaMetadata(type, idPrefix, rawId) {
             const metaType = type === 'movie' ? 'movie' : 'series';
             const res = await axios.get(`https://v3-cinemeta.strem.io/meta/${metaType}/${imdbId}.json`, { timeout: 5000 });
             const meta = res.data?.meta || {};
+            const ptDesc = meta.description ? await translateToPtBr(meta.description) : '';
             return {
                 id: imdbId,
                 name: meta.name || '',
                 title: meta.name || '',
                 poster: meta.poster || `https://images.metahub.space/poster/medium/${imdbId}/img`,
                 background: meta.background || `https://images.metahub.space/background/medium/${imdbId}/img`,
-                description: meta.description || '',
+                description: ptDesc,
                 releaseInfo: meta.releaseInfo || '',
                 year: meta.releaseInfo?.split('–')[0] || ''
             };
@@ -626,7 +735,7 @@ app.get(['/', '/configure', '/:config/configure'], (req, res) => {
     <html lang="pt-BR">
     <head>
         <meta charset="UTF-8">
-        <title>Stremio PT-BR Pro 3.1</title>
+        <title>Stremio PT-BR Pro 3.2</title>
         <style>
             body { font-family: system-ui, sans-serif; background: #0f172a; color: #f8fafc; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 1rem; }
             .card { background: #1e293b; padding: 2rem; border-radius: 12px; width: 100%; max-width: 500px; box-shadow: 0 10px 25px rgba(0,0,0,0.4); }
@@ -647,9 +756,9 @@ app.get(['/', '/configure', '/:config/configure'], (req, res) => {
     </head>
     <body>
         <div class="card">
-            <h2>🎬 Stremio PT-BR Pro 3.1</h2>
+            <h2>🎬 Stremio PT-BR Pro 3.2</h2>
             <div class="badges">
-                <span class="badge">Metadados Completos</span>
+                <span class="badge">Sinopses 100% PT-BR</span>
                 <span class="badge">Recomendados & Continue Assistindo</span>
                 <span class="badge">🧲 P2P & ⚡ TorBox</span>
             </div>
@@ -671,8 +780,8 @@ app.get(['/', '/configure', '/:config/configure'], (req, res) => {
                 </label>
             </div>
             
-            <label>TMDB API Key (Opcional - Traduz capas e sinopses para PT-BR):</label>
-            <input type="text" id="tmdbKey" placeholder="Opcional: deixe em branco para usar catálogo padrão" oninput="updateLinks()" />
+            <label>TMDB API Key (Opcional - Sinopses já são traduzidas automaticamente):</label>
+            <input type="text" id="tmdbKey" placeholder="Opcional: tradução automática PT-BR já está ativa!" oninput="updateLinks()" />
 
             <label>Indexadores Extras Opcionais (separados por vírgula):</label>
             <input type="text" id="customIndexers" placeholder="Opcional: Torrentio, Brazuca e MediaFusion já inclusos" oninput="updateLinks()" />
@@ -772,7 +881,7 @@ app.get([
     '/:config/catalog/:type/:id/:extra.json'
 ], handleCatalogRequest);
 
-// Rota Completa de Metadados (Resolve o erro "Nenhum addon fornece metadados para este conteúdo")
+// Rota Completa de Metadados com Tradução PT-BR Automática
 async function handleMetaRequest(req, res) {
     const { config: configStr, type } = req.params;
     const rawId = decodeURIComponent(req.params.id || '');
