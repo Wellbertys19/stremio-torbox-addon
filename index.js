@@ -54,7 +54,6 @@ function translateGenresToPtBr(genres = []) {
     return genres.map(g => GENRE_TRANSLATIONS[g] || g);
 }
 
-// Traduz um único texto para PT-BR
 async function translateToPtBr(text) {
     if (!text || typeof text !== 'string') return '';
     const cleanText = text.replace(/\s*\[Written by [^\]]+\]\s*/gi, '').replace(/[\r\n]+/g, ' ').trim();
@@ -68,7 +67,6 @@ async function translateToPtBr(text) {
     return translated || cleanText;
 }
 
-// Traduz dezenas de sinopses e títulos de episódios de uma só vez em blocos rápidos
 async function translateBatchToPtBr(texts = []) {
     if (!Array.isArray(texts) || texts.length === 0) return [];
 
@@ -91,7 +89,6 @@ async function translateBatchToPtBr(texts = []) {
 
     if (missingTexts.length === 0) return results;
 
-    // Agrupa textos em blocos de até 3200 caracteres (1 linha = 1 episódio)
     const chunks = [];
     let currentChunkTexts = [];
     let currentChunkIndices = [];
@@ -148,7 +145,6 @@ async function translateBatchToPtBr(texts = []) {
                 }
             } catch {}
 
-            // Fallback se falhar a rede
             for (let j = 0; j < chunk.texts.length; j++) {
                 results[chunk.indices[j]] = chunk.texts[j];
             }
@@ -248,9 +244,9 @@ function buildManifest(config = {}) {
 
     return {
         id: 'org.community.torbox.ptbr.pro',
-        version: '3.3.0',
+        version: '3.4.0',
         name: addonName,
-        description: 'Catálogos, Episódios e Sinopses 100% em Português (Filmes, Séries e Animes) com TorBox e P2P.',
+        description: 'Catálogos, Episódios em Português e Streams ordenados por Qualidade e Tamanho (TorBox & P2P).',
         resources: ['catalog', 'meta', 'stream'],
         types: ['movie', 'series', 'anime'],
         idPrefixes: ['tt', 'kitsu'],
@@ -332,50 +328,80 @@ function isPtBrStream(text, onlyDubbed = false, isNativePtBrSource = false) {
 }
 
 // =========================================================
-// FORMATADOR CUSTOMIZADO (⚡ TORBOX & 🧲 P2P)
+// FORMATADOR E CLASSIFICADOR POR QUALIDADE E TAMANHO
 // =========================================================
 
 function parseAndFormatStream(rawTitle = '', season = null) {
-    const seedsMatch = rawTitle.match(/👤\s*(\d+)/);
-    const seeds = seedsMatch ? parseInt(seedsMatch[1], 10) : 0;
+    // 1. Extrai Tamanho e converte para MB exatos para ordenação do maior para o menor
+    const sizeMatch = rawTitle.match(/(?:💾\s*)?(\d+(?:[.,]\d+)?)\s*(GB|MB|GiB|MiB)/i);
+    let sizeText = 'Tamanho N/D';
+    let sizeInMB = 0;
 
-    const sizeMatch = rawTitle.match(/(?:💾\s*)?(\d+(?:[.,]\d+)?\s*(?:GB|MB|GiB|MiB))/i);
-    const sizeText = sizeMatch ? sizeMatch[1].toUpperCase().replace('GIB', 'GB').replace('MIB', 'MB') : 'Tamanho N/D';
+    if (sizeMatch) {
+        const rawValue = parseFloat(sizeMatch[1].replace(',', '.'));
+        const rawUnit = sizeMatch[2].toUpperCase().replace('GIB', 'GB').replace('MIB', 'MB');
+        sizeText = `${rawValue} ${rawUnit}`;
+        sizeInMB = rawUnit === 'GB' ? rawValue * 1024 : rawValue;
+    }
 
-    let wrongSeasonPenalty = 0;
+    // 2. Verifica se pertence à temporada correta (para não misturar temporadas diferentes no topo)
+    let isRightSeason = 1;
     const firstLine = rawTitle.split('\n')[0] || '';
     if (season !== null) {
         const seasonMention = firstLine.match(/(\d+)\s*[ªa°]?\s*temporada|\bs0?(\d+)\b/i);
         if (seasonMention) {
             const foundSeason = parseInt(seasonMention[1] || seasonMention[2], 10);
             if (foundSeason !== season && !/todas\s*temporada|completa/i.test(firstLine)) {
-                wrongSeasonPenalty = -500;
+                isRightSeason = 0;
             }
         }
     }
 
+    // 3. Detecta Resolução (Hierarquia 1: 4K > 1080p > 720p > 480p)
     let resolution = 'HD';
-    let score = 150;
+    let resolutionRank = 2;
     if (/\b(2160p|4k|uhd)\b/i.test(rawTitle)) {
         resolution = '4K';
-        score = 400;
+        resolutionRank = 5;
     } else if (/\b(1080p|fhd|full\s*hd)\b/i.test(rawTitle)) {
         resolution = '1080p';
-        score = 300;
+        resolutionRank = 4;
     } else if (/\b(720p|hd)\b/i.test(rawTitle)) {
         resolution = '720p';
-        score = 200;
+        resolutionRank = 3;
     } else if (/\b(480p|360p)\b/i.test(rawTitle)) {
         resolution = '480p';
-        score = 100;
+        resolutionRank = 1;
     }
 
+    // 4. Detecta Qualidade da Fonte/Bitrate (Hierarquia 2: Remux > BluRay > BDRip > WEB-DL > WEBRip > HDTV)
+    let sourceQualityRank = 30; // Padrão WEB-DL
+    if (/\bremux\b/i.test(rawTitle)) {
+        sourceQualityRank = 60;
+    } else if (/\bblu-?ray\b/i.test(rawTitle) && !/\b(bdrip|brrip)\b/i.test(rawTitle)) {
+        sourceQualityRank = 50;
+    } else if (/\b(bdrip|brrip)\b/i.test(rawTitle)) {
+        sourceQualityRank = 40;
+    } else if (/\bweb-?dl\b/i.test(rawTitle)) {
+        sourceQualityRank = 30;
+    } else if (/\bwebrip\b/i.test(rawTitle)) {
+        sourceQualityRank = 20;
+    } else if (/\b(hdtv|dvdrip)\b/i.test(rawTitle)) {
+        sourceQualityRank = 10;
+    }
+
+    if (/\b(hdr|hdr10|dv|dolby\s*vision)\b/i.test(rawTitle)) sourceQualityRank += 5;
+    if (/\b(hevc|x265|10bit)\b/i.test(rawTitle)) sourceQualityRank += 2;
+
+    // 5. Detecta Áudio (Dublado vs Legendado)
     const isDubOrDual = /(\bdublado\b|\bdub\b|\bdual[-_. ]?audio\b|\bdual\b|\bnacional\b)/i.test(rawTitle);
     const audioLabel = isDubOrDual ? 'Dublado' : 'Legendado';
-    if (isDubOrDual) score += 50;
+    const audioRank = isDubOrDual ? 2 : 1;
 
+    // 6. Monta o texto limpo de Qualidade para exibição
     const qualityTokens = [];
     const tokenMap = [
+        { regex: /\bremux\b/i, label: 'Remux' },
         { regex: /\bbdrip\b/i, label: 'BDRip' },
         { regex: /\bbrrip\b/i, label: 'BRRip' },
         { regex: /\bblu-?ray\b/i, label: 'BluRay' },
@@ -383,7 +409,6 @@ function parseAndFormatStream(rawTitle = '', season = null) {
         { regex: /\bwebrip\b/i, label: 'WEBRip' },
         { regex: /\bhdtv\b/i, label: 'HDTV' },
         { regex: /\bdvdrip\b/i, label: 'DVDRip' },
-        { regex: /\bremux\b/i, label: 'Remux' },
         { regex: /\b(hdr|hdr10)\b/i, label: 'HDR' },
         { regex: /\b(dv|dolby\s*vision)\b/i, label: 'Dolby Vision' },
         { regex: /\b(hevc|x265)\b/i, label: 'x265' }
@@ -396,16 +421,38 @@ function parseAndFormatStream(rawTitle = '', season = null) {
     }
 
     const qualityText = qualityTokens.length > 0 ? qualityTokens.join(' ') : 'WEB-DL';
-    score += Math.min(seeds, 40) + wrongSeasonPenalty;
-
     const formattedDescription = `🎞️ • ${qualityText}\n📦 • ${sizeText}`;
 
     return {
         resolution,
         audioLabel,
         formattedDescription,
-        score
+        isRightSeason,
+        resolutionRank,
+        sourceQualityRank,
+        audioRank,
+        sizeInMB
     };
+}
+
+// Função de ordenação estrita: 1º Cache TorBox -> 2º Temporada Correta -> 3º Resolução (4K/1080p/720p) -> 4º Qualidade da Fonte -> 5º Maior Tamanho (MB/GB)
+function compareStreamsByQualityAndSize(a, b) {
+    if (b._sort.cacheRank !== a._sort.cacheRank) {
+        return b._sort.cacheRank - a._sort.cacheRank;
+    }
+    if (b._sort.isRightSeason !== a._sort.isRightSeason) {
+        return b._sort.isRightSeason - a._sort.isRightSeason;
+    }
+    if (b._sort.resolutionRank !== a._sort.resolutionRank) {
+        return b._sort.resolutionRank - a._sort.resolutionRank;
+    }
+    if (b._sort.sourceQualityRank !== a._sort.sourceQualityRank) {
+        return b._sort.sourceQualityRank - a._sort.sourceQualityRank;
+    }
+    if (b._sort.sizeInMB !== a._sort.sizeInMB) {
+        return b._sort.sizeInMB - a._sort.sizeInMB;
+    }
+    return b._sort.audioRank - a._sort.audioRank;
 }
 
 function extractInfoHash(streamObj) {
@@ -450,7 +497,6 @@ async function fetchAnimesCatalog(searchQuery = '', skip = 0) {
     }
 }
 
-// Metadados completos de Animes com sinopses e títulos de episódios traduzidos
 async function fetchAnimeMeta(kitsuId, requestedType = 'anime') {
     const cacheKey = `kitsu:${kitsuId}:${requestedType}`;
     if (metaTranslationCache.has(cacheKey)) {
@@ -466,7 +512,6 @@ async function fetchAnimeMeta(kitsuId, requestedType = 'anime') {
         const attr = animeRes.data?.data?.attributes || {};
         const episodes = epRes.data?.data || [];
 
-        // Prepara lote de tradução: [sinopse principal, títulos dos episódios..., sinopses dos episódios...]
         const epTitles = episodes.map(ep => ep.attributes?.canonicalTitle || '');
         const epSynopses = episodes.map(ep => ep.attributes?.synopsis || ep.attributes?.description || '');
 
@@ -530,7 +575,6 @@ async function fetchAnimeMeta(kitsuId, requestedType = 'anime') {
     }
 }
 
-// Metadados completos de Filmes e Séries (IMDb) + Tradução de TODOS os Episódios das Temporadas
 async function fetchImdbMeta(type, imdbId, tmdbKey = '') {
     const cleanId = imdbId.split(':')[0];
     const metaType = type === 'movie' ? 'movie' : 'series';
@@ -548,7 +592,6 @@ async function fetchImdbMeta(type, imdbId, tmdbKey = '') {
 
         let isTranslatedByTmdb = false;
 
-        // 1. Se tiver TMDB Key configurada, busca título, capa e sinopse oficial PT-BR
         if (tmdbKey) {
             try {
                 const findRes = await axios.get(
@@ -574,7 +617,6 @@ async function fetchImdbMeta(type, imdbId, tmdbKey = '') {
             } catch {}
         }
 
-        // 2. Traduz a sinopse principal + TODOS os títulos e resumos de episódios (meta.videos) em lote!
         const videos = Array.isArray(meta.videos) ? meta.videos : [];
         const videoTitles = videos.map(v => v.name || v.title || '');
         const videoOverviews = videos.map(v => v.overview || v.description || '');
@@ -608,7 +650,6 @@ async function fetchImdbMeta(type, imdbId, tmdbKey = '') {
             });
         }
 
-        // 3. Traduz os géneros
         if (meta.genres) meta.genres = translateGenresToPtBr(meta.genres);
         if (meta.genre) meta.genre = translateGenresToPtBr(meta.genre);
 
@@ -831,7 +872,7 @@ app.get(['/', '/configure', '/:config/configure'], (req, res) => {
     <html lang="pt-BR">
     <head>
         <meta charset="UTF-8">
-        <title>Stremio PT-BR Pro 3.3</title>
+        <title>Stremio PT-BR Pro 3.4</title>
         <style>
             body { font-family: system-ui, sans-serif; background: #0f172a; color: #f8fafc; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 1rem; }
             .card { background: #1e293b; padding: 2rem; border-radius: 12px; width: 100%; max-width: 500px; box-shadow: 0 10px 25px rgba(0,0,0,0.4); }
@@ -852,10 +893,10 @@ app.get(['/', '/configure', '/:config/configure'], (req, res) => {
     </head>
     <body>
         <div class="card">
-            <h2>🎬 Stremio PT-BR Pro 3.3</h2>
+            <h2>🎬 Stremio PT-BR Pro 3.4</h2>
             <div class="badges">
+                <span class="badge">Prioridade: Qualidade + Tamanho</span>
                 <span class="badge">Episódios & Sinopses PT-BR</span>
-                <span class="badge">Recomendados & Continue Assistindo</span>
                 <span class="badge">🧲 P2P & ⚡ TorBox</span>
             </div>
             
@@ -977,7 +1018,7 @@ app.get([
     '/:config/catalog/:type/:id/:extra.json'
 ], handleCatalogRequest);
 
-// Rota Completa de Metadados (Traduz Sinopse Principal + Todos os Episódios em Lote)
+// Rota Completa de Metadados
 async function handleMetaRequest(req, res) {
     const { config: configStr, type } = req.params;
     const rawId = decodeURIComponent(req.params.id || '');
@@ -1005,7 +1046,7 @@ app.get([
     '/:config/meta/:type/:id.json'
 ], handleMetaRequest);
 
-// Rota de Streams
+// Rota de Streams (Ordenação Estrita por Qualidade e Tamanho)
 async function handleStreamRequest(req, res) {
     const { config: configStr, type } = req.params;
     const id = decodeURIComponent(req.params.id || '');
@@ -1061,9 +1102,6 @@ async function handleStreamRequest(req, res) {
             if (config.cachedOnly && !isCached) continue;
 
             const info = parseAndFormatStream(item.title, season);
-            const cacheBonus = isCached ? 2000 : 1000;
-            const totalScore = cacheBonus + info.score;
-
             const resolveUrl = `${host}/${configStr || 'p2p'}/resolve/${item.infoHash}/${season ?? 0}/${episode ?? 0}`;
 
             scoredStreams.push({
@@ -1073,7 +1111,14 @@ async function handleStreamRequest(req, res) {
                 behaviorHints: {
                     bingeGroup: `torbox-ptbr-${info.resolution}-${isCached ? 'cached' : 'uncached'}`
                 },
-                _score: totalScore
+                _sort: {
+                    cacheRank: isCached ? 2 : 1,
+                    isRightSeason: info.isRightSeason,
+                    resolutionRank: info.resolutionRank,
+                    sourceQualityRank: info.sourceQualityRank,
+                    sizeInMB: info.sizeInMB,
+                    audioRank: info.audioRank
+                }
             });
         }
     }
@@ -1092,14 +1137,22 @@ async function handleStreamRequest(req, res) {
                 behaviorHints: {
                     bingeGroup: `p2p-ptbr-${info.resolution}`
                 },
-                _score: info.score
+                _sort: {
+                    cacheRank: 0,
+                    isRightSeason: info.isRightSeason,
+                    resolutionRank: info.resolutionRank,
+                    sourceQualityRank: info.sourceQualityRank,
+                    sizeInMB: info.sizeInMB,
+                    audioRank: info.audioRank
+                }
             });
         }
     }
 
-    scoredStreams.sort((a, b) => b._score - a._score);
+    // Aplica a ordenação estrita por Qualidade e Tamanho (do maior para o menor)
+    scoredStreams.sort(compareStreamsByQualityAndSize);
 
-    const finalStreams = scoredStreams.map(({ _score, ...stream }) => stream);
+    const finalStreams = scoredStreams.map(({ _sort, ...stream }) => stream);
     res.json({ streams: finalStreams });
 }
 
