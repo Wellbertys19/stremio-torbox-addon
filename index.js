@@ -15,7 +15,7 @@ app.use((req, res, next) => {
 const PORT = process.env.PORT || 7000;
 const TORBOX_API = 'https://api.torbox.app/v1/api';
 
-// Histórico em memória para alimentar a fileira "Continue Assistindo"
+// Histórico em memória para a fileira "Continue Assistindo"
 const recentlyWatched = {
     movie: [],
     series: []
@@ -25,14 +25,15 @@ function addToContinueWatching(type, metaObj) {
     if (!metaObj || !metaObj.id || !metaObj.name) return;
     const targetType = type === 'movie' ? 'movie' : 'series';
     const list = recentlyWatched[targetType];
-    const existingIdx = list.findIndex(item => item.id === metaObj.id);
+    const cleanId = metaObj.id.split(':')[0];
+    const existingIdx = list.findIndex(item => item.id === cleanId);
     if (existingIdx !== -1) list.splice(existingIdx, 1);
     list.unshift({
-        id: metaObj.id,
+        id: cleanId,
         type: targetType,
         name: metaObj.name,
-        poster: metaObj.poster || `https://images.metahub.space/poster/medium/${metaObj.id.split(':')[0]}/img`,
-        background: metaObj.background || `https://images.metahub.space/background/medium/${metaObj.id.split(':')[0]}/img`,
+        poster: metaObj.poster || `https://images.metahub.space/poster/medium/${cleanId}/img`,
+        background: metaObj.background || `https://images.metahub.space/background/medium/${cleanId}/img`,
         description: metaObj.description || '',
         releaseInfo: metaObj.releaseInfo || ''
     });
@@ -101,14 +102,11 @@ function buildManifest(config = {}) {
 
     return {
         id: 'org.community.torbox.ptbr.pro',
-        version: '3.0.0',
+        version: '3.1.0',
         name: addonName,
-        description: 'Catálogos completos (Recomendados, Continue Assistindo, Em Alta) e Streams em PT-BR com TorBox e P2P.',
-        resources: [
-            'catalog',
-            { name: 'meta', types: ['anime', 'series'], idPrefixes: ['kitsu'] },
-            'stream'
-        ],
+        description: 'Catálogos, Metadados (Filmes, Séries e Animes) e Streams em PT-BR com TorBox e P2P.',
+        // Agora 'meta' está ativo para todos os tipos (movie, series, anime) e prefixos (tt, kitsu)
+        resources: ['catalog', 'meta', 'stream'],
         types: ['movie', 'series', 'anime'],
         idPrefixes: ['tt', 'kitsu'],
         catalogs: [
@@ -275,7 +273,7 @@ function extractInfoHash(streamObj) {
 }
 
 // =========================================================
-// MOTOR DE CATÁLOGOS (RECOMENDADOS, CONTINUE ASSISTINDO, ANIMES)
+// MOTOR DE CATÁLOGOS E METADADOS COMPLETOS (FILMES, SÉRIES, ANIMES)
 // =========================================================
 
 async function fetchAnimesCatalog(searchQuery = '', skip = 0) {
@@ -304,8 +302,8 @@ async function fetchAnimesCatalog(searchQuery = '', skip = 0) {
     }
 }
 
-// Carrega os episódios e detalhes quando o usuário clica num Anime do catálogo
-async function fetchAnimeMeta(kitsuId) {
+// Carrega metadados e lista de episódios para Animes (Kitsu)
+async function fetchAnimeMeta(kitsuId, requestedType = 'anime') {
     try {
         const [animeRes, epRes] = await Promise.all([
             axios.get(`https://kitsu.io/api/edge/anime/${kitsuId}`, { timeout: 6000 }),
@@ -328,9 +326,20 @@ async function fetchAnimeMeta(kitsuId) {
             };
         });
 
+        // Se o anime for filme único ou ainda não tiver lista detalhada, cria o item de reprodução
+        if (videos.length === 0) {
+            videos.push({
+                id: `kitsu:${kitsuId}:1`,
+                title: attr.canonicalTitle || 'Episódio 1',
+                season: 1,
+                episode: 1,
+                released: new Date().toISOString()
+            });
+        }
+
         return {
             id: `kitsu:${kitsuId}`,
-            type: 'anime',
+            type: requestedType,
             name: attr.titles?.pt_br || attr.titles?.en || attr.canonicalTitle || 'Anime',
             poster: attr.posterImage?.large || attr.posterImage?.original || '',
             background: attr.coverImage?.original || attr.posterImage?.original || '',
@@ -344,19 +353,62 @@ async function fetchAnimeMeta(kitsuId) {
     }
 }
 
+// Carrega metadados completos (sinopse, fundo, temporadas e episódios) para Filmes e Séries (IMDb tt...)
+async function fetchImdbMeta(type, imdbId, tmdbKey = '') {
+    const cleanId = imdbId.split(':')[0];
+    const metaType = type === 'movie' ? 'movie' : 'series';
+
+    try {
+        const res = await axios.get(`https://v3-cinemeta.strem.io/meta/${metaType}/${cleanId}.json`, { timeout: 7500 });
+        const meta = res.data?.meta;
+
+        if (!meta) return null;
+
+        // Se o usuário configurou TMDB Key, traduz o título, capa e sinopse para PT-BR
+        if (tmdbKey) {
+            try {
+                const findRes = await axios.get(
+                    `https://api.themoviedb.org/3/find/${cleanId}`,
+                    {
+                        params: { api_key: tmdbKey, external_source: 'imdb_id', language: 'pt-BR' },
+                        timeout: 4000
+                    }
+                );
+                const match = metaType === 'movie'
+                    ? findRes.data?.movie_results?.[0]
+                    : findRes.data?.tv_results?.[0];
+
+                if (match) {
+                    meta.name = match.title || match.name || meta.name;
+                    if (match.overview) meta.description = match.overview;
+                    if (match.poster_path) meta.poster = `https://image.tmdb.org/t/p/w500${match.poster_path}`;
+                    if (match.backdrop_path) meta.background = `https://image.tmdb.org/t/p/original${match.backdrop_path}`;
+                }
+            } catch {}
+        }
+
+        return meta;
+    } catch {
+        // Fallback básico para nunca falhar ao abrir a tela do filme/série
+        return {
+            id: cleanId,
+            type: metaType,
+            name: cleanId,
+            poster: `https://images.metahub.space/poster/medium/${cleanId}/img`,
+            background: `https://images.metahub.space/background/medium/${cleanId}/img`
+        };
+    }
+}
+
 async function fetchMoviesOrSeriesCatalog(type, catalogId, extraObj = {}, tmdbKey = '') {
     try {
-        // Se for a fileira "Continue Assistindo"
         if (catalogId.includes('continue')) {
             const saved = recentlyWatched[type] || [];
             if (saved.length > 0) return saved;
-            // Se o usuário ainda não assistiu nada na sessão, exibe sugestões em alta para a fileira não ficar vazia
         }
 
-        // Define se usa o feed de Populares (top) ou Melhores Avaliados (imdbRating)
         const feedType = catalogId.includes('top') ? 'imdbRating' : 'top';
 
-        // Monta os filtros extras sem enviar "skip=0" (que causava erro 404 no Cinemeta)
         const extraParts = [];
         if (extraObj.search) extraParts.push(`search=${encodeURIComponent(extraObj.search)}`);
         if (extraObj.genre) extraParts.push(`genre=${encodeURIComponent(extraObj.genre)}`);
@@ -370,7 +422,6 @@ async function fetchMoviesOrSeriesCatalog(type, catalogId, extraObj = {}, tmdbKe
         const res = await axios.get(url, { timeout: 7500 });
         const metas = (res.data?.metas || []).slice(0, 24);
 
-        // Se o usuário preencheu a chave opcional do TMDB, traduz títulos, capas e sinopses para PT-BR
         if (tmdbKey && metas.length > 0) {
             return await Promise.all(
                 metas.map(async (meta) => {
@@ -575,7 +626,7 @@ app.get(['/', '/configure', '/:config/configure'], (req, res) => {
     <html lang="pt-BR">
     <head>
         <meta charset="UTF-8">
-        <title>Stremio PT-BR Pro 3.0</title>
+        <title>Stremio PT-BR Pro 3.1</title>
         <style>
             body { font-family: system-ui, sans-serif; background: #0f172a; color: #f8fafc; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 1rem; }
             .card { background: #1e293b; padding: 2rem; border-radius: 12px; width: 100%; max-width: 500px; box-shadow: 0 10px 25px rgba(0,0,0,0.4); }
@@ -596,10 +647,10 @@ app.get(['/', '/configure', '/:config/configure'], (req, res) => {
     </head>
     <body>
         <div class="card">
-            <h2>🎬 Stremio PT-BR Pro 3.0</h2>
+            <h2>🎬 Stremio PT-BR Pro 3.1</h2>
             <div class="badges">
-                <span class="badge">Recomendados para Você</span>
-                <span class="badge">Continue Assistindo</span>
+                <span class="badge">Metadados Completos</span>
+                <span class="badge">Recomendados & Continue Assistindo</span>
                 <span class="badge">🧲 P2P & ⚡ TorBox</span>
             </div>
             
@@ -689,7 +740,7 @@ app.get(['/manifest.json', '/:config/manifest.json', '/*/manifest.json'], (req, 
     res.json(buildManifest(config));
 });
 
-// Rota de Catálogo (Recomendados para Você, Continue Assistindo, Melhores Avaliados, Animes)
+// Rota de Catálogo
 async function handleCatalogRequest(req, res) {
     const { config: configStr, type, id: catalogId, extra } = req.params;
     const config = decodeConfig(configStr);
@@ -721,23 +772,38 @@ app.get([
     '/:config/catalog/:type/:id/:extra.json'
 ], handleCatalogRequest);
 
-// Rota de Metadados para Animes (abre temporadas/episódios ao clicar na capa do Anime)
+// Rota Completa de Metadados (Resolve o erro "Nenhum addon fornece metadados para este conteúdo")
+async function handleMetaRequest(req, res) {
+    const { config: configStr, type } = req.params;
+    const rawId = decodeURIComponent(req.params.id || '');
+    const config = decodeConfig(configStr);
+
+    if (rawId.startsWith('kitsu:')) {
+        const kitsuId = rawId.split(':')[1];
+        const meta = await fetchAnimeMeta(kitsuId, type);
+        return res.json({ meta });
+    }
+
+    if (rawId.startsWith('tt')) {
+        const meta = await fetchImdbMeta(type, rawId, config.tmdbKey);
+        if (meta && meta.name) {
+            addToContinueWatching(type, meta);
+        }
+        return res.json({ meta });
+    }
+
+    res.json({ meta: null });
+}
+
 app.get([
     '/meta/:type/:id.json',
     '/:config/meta/:type/:id.json'
-], async (req, res) => {
-    const { id } = req.params;
-    if (id.startsWith('kitsu:')) {
-        const kitsuId = id.split(':')[1];
-        const meta = await fetchAnimeMeta(kitsuId);
-        if (meta) return res.json({ meta });
-    }
-    res.json({ meta: null });
-});
+], handleMetaRequest);
 
-// Rota de Streams + Registro automático no "Continue Assistindo"
+// Rota de Streams
 async function handleStreamRequest(req, res) {
-    const { config: configStr, type, id } = req.params;
+    const { config: configStr, type } = req.params;
+    const id = decodeURIComponent(req.params.id || '');
     const config = decodeConfig(configStr);
     const mode = config.mode || (config.apiKey ? 'torbox' : 'p2p');
 
@@ -759,7 +825,6 @@ async function handleStreamRequest(req, res) {
 
     const metadata = await getMediaMetadata(type, idPrefix, id);
 
-    // Salva automaticamente o filme/série na fileira "Continue Assistindo"
     if (idPrefix === 'tt' && metadata.name) {
         addToContinueWatching(type, metadata);
     }
