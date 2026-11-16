@@ -14,6 +14,7 @@ app.use((req, res, next) => {
 
 const PORT = process.env.PORT || 7000;
 const TORBOX_API = 'https://api.torbox.app/v1/api';
+const TORBOX_SEARCH_API = 'https://search-api.torbox.app';
 
 // =========================================================
 // MOTOR DE TRADUÇÃO EM LOTE (SINOPSES + TODOS OS EPISÓDIOS)
@@ -155,7 +156,7 @@ async function translateBatchToPtBr(texts = []) {
 }
 
 // =========================================================
-// HISTÓRICO "CONTINUE ASSISTINDO"
+// HISTÓRICO "CONTINUE ASSISTINDO" E INDEXADORES
 // =========================================================
 
 const recentlyWatched = {
@@ -182,16 +183,6 @@ function addToContinueWatching(type, metaObj) {
     if (list.length > 20) list.pop();
 }
 
-const PUBLIC_TRACKERS = [
-    'dht:6881',
-    'tracker:udp://tracker.opentrackr.org:1337/announce',
-    'tracker:udp://open.demonii.com:1337/announce',
-    'tracker:udp://open.stealth.si:80/announce',
-    'tracker:udp://exodus.desync.com:6969/announce',
-    'tracker:udp://tracker.torrent.eu.org:451/announce',
-    'tracker:http://tracker.openbittorrent.com:80/announce'
-];
-
 const DEFAULT_INDEXERS = [
     {
         name: 'Torrentio',
@@ -206,6 +197,11 @@ const DEFAULT_INDEXERS = [
     {
         name: 'MediaFusion',
         url: 'https://mediafusion.elfhosted.com',
+        isNativePtBr: false
+    },
+    {
+        name: 'Comet',
+        url: 'https://comet.elfhosted.com',
         isNativePtBr: false
     }
 ];
@@ -226,27 +222,21 @@ const GENRE_OPTIONS = [
 ];
 
 function decodeConfig(configStr) {
-    if (!configStr || configStr === 'configure') return { mode: 'p2p' };
+    if (!configStr || configStr === 'configure') return { mode: 'torbox' };
     try {
         const b64 = configStr.replace(/-/g, '+').replace(/_/g, '/');
         return JSON.parse(Buffer.from(b64, 'base64').toString('utf8'));
     } catch {
-        return { mode: 'p2p' };
+        return { mode: 'torbox' };
     }
 }
 
 function buildManifest(config = {}) {
-    const mode = config.mode || (config.apiKey ? 'torbox' : 'p2p');
-    let addonName = 'Stremio PT-BR Pro';
-    if (mode === 'p2p') addonName = 'Stremio PT-BR (P2P)';
-    if (mode === 'torbox') addonName = 'TorBox PT-BR Pro';
-    if (mode === 'hybrid') addonName = 'TorBox + P2P PT-BR';
-
     return {
         id: 'org.community.torbox.ptbr.pro',
-        version: '3.4.0',
-        name: addonName,
-        description: 'Catálogos, Episódios em Português e Streams ordenados por Qualidade e Tamanho (TorBox & P2P).',
+        version: '4.0.0',
+        name: config.apiKey ? 'TorBox PT-BR All-In-One' : 'TorBox PT-BR (Configurar API)',
+        description: 'Todos os meios TorBox (Torrents Cache, Usenet Pro, WebDL e Nuvem Pessoal) + Catálogos e Episódios em PT-BR (P2P Desativado).',
         resources: ['catalog', 'meta', 'stream'],
         types: ['movie', 'series', 'anime'],
         idPrefixes: ['tt', 'kitsu'],
@@ -331,20 +321,30 @@ function isPtBrStream(text, onlyDubbed = false, isNativePtBrSource = false) {
 // FORMATADOR E CLASSIFICADOR POR QUALIDADE E TAMANHO
 // =========================================================
 
-function parseAndFormatStream(rawTitle = '', season = null) {
-    // 1. Extrai Tamanho e converte para MB exatos para ordenação do maior para o menor
+function formatBytesToSizeText(bytes) {
+    if (!bytes || isNaN(bytes) || bytes <= 0) return null;
+    const mb = bytes / (1024 * 1024);
+    if (mb >= 1024) {
+        return `${(mb / 1024).toFixed(2)} GB`;
+    }
+    return `${mb.toFixed(2)} MB`;
+}
+
+function parseAndFormatStream(rawTitle = '', season = null, explicitBytes = 0) {
     const sizeMatch = rawTitle.match(/(?:💾\s*)?(\d+(?:[.,]\d+)?)\s*(GB|MB|GiB|MiB)/i);
     let sizeText = 'Tamanho N/D';
     let sizeInMB = 0;
 
-    if (sizeMatch) {
+    if (explicitBytes && explicitBytes > 0) {
+        sizeInMB = explicitBytes / (1024 * 1024);
+        sizeText = formatBytesToSizeText(explicitBytes) || 'Tamanho N/D';
+    } else if (sizeMatch) {
         const rawValue = parseFloat(sizeMatch[1].replace(',', '.'));
         const rawUnit = sizeMatch[2].toUpperCase().replace('GIB', 'GB').replace('MIB', 'MB');
         sizeText = `${rawValue} ${rawUnit}`;
         sizeInMB = rawUnit === 'GB' ? rawValue * 1024 : rawValue;
     }
 
-    // 2. Verifica se pertence à temporada correta (para não misturar temporadas diferentes no topo)
     let isRightSeason = 1;
     const firstLine = rawTitle.split('\n')[0] || '';
     if (season !== null) {
@@ -357,7 +357,6 @@ function parseAndFormatStream(rawTitle = '', season = null) {
         }
     }
 
-    // 3. Detecta Resolução (Hierarquia 1: 4K > 1080p > 720p > 480p)
     let resolution = 'HD';
     let resolutionRank = 2;
     if (/\b(2160p|4k|uhd)\b/i.test(rawTitle)) {
@@ -374,8 +373,7 @@ function parseAndFormatStream(rawTitle = '', season = null) {
         resolutionRank = 1;
     }
 
-    // 4. Detecta Qualidade da Fonte/Bitrate (Hierarquia 2: Remux > BluRay > BDRip > WEB-DL > WEBRip > HDTV)
-    let sourceQualityRank = 30; // Padrão WEB-DL
+    let sourceQualityRank = 30;
     if (/\bremux\b/i.test(rawTitle)) {
         sourceQualityRank = 60;
     } else if (/\bblu-?ray\b/i.test(rawTitle) && !/\b(bdrip|brrip)\b/i.test(rawTitle)) {
@@ -393,12 +391,10 @@ function parseAndFormatStream(rawTitle = '', season = null) {
     if (/\b(hdr|hdr10|dv|dolby\s*vision)\b/i.test(rawTitle)) sourceQualityRank += 5;
     if (/\b(hevc|x265|10bit)\b/i.test(rawTitle)) sourceQualityRank += 2;
 
-    // 5. Detecta Áudio (Dublado vs Legendado)
     const isDubOrDual = /(\bdublado\b|\bdub\b|\bdual[-_. ]?audio\b|\bdual\b|\bnacional\b)/i.test(rawTitle);
     const audioLabel = isDubOrDual ? 'Dublado' : 'Legendado';
     const audioRank = isDubOrDual ? 2 : 1;
 
-    // 6. Monta o texto limpo de Qualidade para exibição
     const qualityTokens = [];
     const tokenMap = [
         { regex: /\bremux\b/i, label: 'Remux' },
@@ -435,7 +431,6 @@ function parseAndFormatStream(rawTitle = '', season = null) {
     };
 }
 
-// Função de ordenação estrita: 1º Cache TorBox -> 2º Temporada Correta -> 3º Resolução (4K/1080p/720p) -> 4º Qualidade da Fonte -> 5º Maior Tamanho (MB/GB)
 function compareStreamsByQualityAndSize(a, b) {
     if (b._sort.cacheRank !== a._sort.cacheRank) {
         return b._sort.cacheRank - a._sort.cacheRank;
@@ -667,7 +662,7 @@ async function fetchImdbMeta(type, imdbId, tmdbKey = '') {
     }
 }
 
-async function fetchMoviesOrSeriesCatalog(type, catalogId, extraObj = {}, tmdbKey = '') {
+async function fetchMoviesOrSeriesCatalog(type, catalogId, extraObj = {}) {
     try {
         if (catalogId.includes('continue')) {
             const saved = recentlyWatched[type] || [];
@@ -698,8 +693,7 @@ async function fetchMoviesOrSeriesCatalog(type, catalogId, extraObj = {}, tmdbKe
             genres: meta.genres ? translateGenresToPtBr(meta.genres) : undefined,
             genre: meta.genre ? translateGenresToPtBr(meta.genre) : undefined
         }));
-    } catch (err) {
-        console.error('Erro ao buscar catálogo:', err.message);
+    } catch {
         return [];
     }
 }
@@ -739,7 +733,11 @@ async function getMediaMetadata(type, idPrefix, rawId) {
     }
 }
 
-async function checkTorBoxCache(apiKey, hashes) {
+// =========================================================
+// TODOS OS MEIOS DE ASSISTIR (TORBOX TORRENTS, USENET, WEBDL & HTTP)
+// =========================================================
+
+async function checkTorBoxTorrentCache(apiKey, hashes) {
     if (!apiKey || !hashes.length) return {};
     try {
         const batch = hashes.slice(0, 100).join(',');
@@ -754,43 +752,117 @@ async function checkTorBoxCache(apiKey, hashes) {
     }
 }
 
-async function searchUserTorBoxCloud(apiKey, queryTitle, onlyDubbed) {
-    if (!apiKey || !queryTitle) return [];
+async function checkTorBoxUsenetCache(apiKey, hashes) {
+    if (!apiKey || !hashes.length) return {};
     try {
-        const res = await axios.get(`${TORBOX_API}/torrents/mylist`, {
+        const batch = hashes.slice(0, 100).join(',');
+        const res = await axios.get(`${TORBOX_API}/usenet/checkcached`, {
             headers: { Authorization: `Bearer ${apiKey}` },
-            params: { bypass_cache: false },
-            timeout: 7000
+            params: { hash: batch, format: 'object', list_files: true },
+            timeout: 8000
         });
-        const list = res.data?.data || [];
-        const normalizedQuery = queryTitle.toLowerCase();
-        return list
-            .filter(item => {
-                const matchesTitle = item.download_present && item.name.toLowerCase().includes(normalizedQuery);
-                return matchesTitle && isPtBrStream(item.name, onlyDubbed, false);
-            })
-            .map(item => {
-                const sizeMB = item.size ? `${(item.size / (1024 * 1024)).toFixed(2)} MB` : '';
-                return {
-                    infoHash: item.hash.toLowerCase(),
-                    title: `${item.name} ${sizeMB}`,
-                    fileIdx: null,
-                    source: 'TorBox Cloud'
-                };
-            });
+        return res.data?.data || {};
     } catch {
-        return [];
+        return {};
     }
 }
 
-async function fetchCandidateTorrents(type, id, customIndexerUrls, apiKey, metadata, onlyDubbed) {
-    const results = [];
+// 1. Busca em TODAS as Nuvens Pessoais do usuário no TorBox (Torrents + Usenet + WebDL)
+async function searchAllUserTorBoxClouds(apiKey, queryTitle, onlyDubbed) {
+    if (!apiKey || !queryTitle) return [];
+    const normalizedQuery = queryTitle.toLowerCase();
+    const headers = { Authorization: `Bearer ${apiKey}` };
 
-    if (apiKey && metadata.title) {
-        const cloudItems = await searchUserTorBoxCloud(apiKey, metadata.title, onlyDubbed);
-        results.push(...cloudItems);
+    const [torrentsRes, usenetRes, webdlRes] = await Promise.allSettled([
+        axios.get(`${TORBOX_API}/torrents/mylist`, { headers, params: { bypass_cache: false }, timeout: 6500 }),
+        axios.get(`${TORBOX_API}/usenet/mylist`, { headers, params: { bypass_cache: false }, timeout: 6500 }),
+        axios.get(`${TORBOX_API}/webdl/mylist`, { headers, params: { bypass_cache: false }, timeout: 6500 })
+    ]);
+
+    const cloudStreams = [];
+
+    const processList = (resObj, cloudType) => {
+        if (resObj.status !== 'fulfilled') return;
+        const list = resObj.value.data?.data || [];
+        for (const item of list) {
+            if (!item.download_present || !item.name) continue;
+            const matchesTitle = item.name.toLowerCase().includes(normalizedQuery);
+            if (matchesTitle && isPtBrStream(item.name, onlyDubbed, true)) {
+                cloudStreams.push({
+                    kind: 'cloud',
+                    cloudType, // 'torrents', 'usenet', 'webdl'
+                    itemId: item.id,
+                    title: item.name,
+                    sizeBytes: item.size || 0
+                });
+            }
+        }
+    };
+
+    processList(torrentsRes, 'torrents');
+    processList(usenetRes, 'usenet');
+    processList(webdlRes, 'webdl');
+
+    return cloudStreams;
+}
+
+// 2. Busca na API Oficial de Pesquisa do TorBox (Torrents + Usenet Pro)
+async function searchTorBoxOfficialApi(apiKey, rawId, season, episode, onlyDubbed) {
+    if (!apiKey) return { torrents: [], usenet: [] };
+
+    const baseImdb = rawId.split(':')[0];
+    if (!baseImdb.startsWith('tt')) return { torrents: [], usenet: [] };
+
+    const params = {};
+    if (season !== null) params.season = season;
+    if (episode !== null) params.episode = episode;
+
+    const headers = { Authorization: `Bearer ${apiKey}` };
+
+    const [torRes, useRes] = await Promise.allSettled([
+        axios.get(`${TORBOX_SEARCH_API}/torrents/imdb:${baseImdb}`, { headers, params, timeout: 6500 }),
+        axios.get(`${TORBOX_SEARCH_API}/usenet/imdb:${baseImdb}`, { headers, params, timeout: 6500 })
+    ]);
+
+    const torrents = [];
+    const usenet = [];
+
+    if (torRes.status === 'fulfilled') {
+        const items = torRes.value.data?.data?.torrents || [];
+        for (const t of items) {
+            const rawTitle = t.raw_title || t.title || '';
+            if (t.hash && isPtBrStream(rawTitle, onlyDubbed, false)) {
+                torrents.push({
+                    infoHash: t.hash.toLowerCase(),
+                    title: rawTitle,
+                    sizeBytes: t.size || 0,
+                    cached: Boolean(t.cached)
+                });
+            }
+        }
     }
 
+    if (useRes.status === 'fulfilled') {
+        const items = useRes.value.data?.data?.nzbs || [];
+        for (const u of items) {
+            const rawTitle = u.raw_title || u.title || '';
+            if (u.nzb && isPtBrStream(rawTitle, onlyDubbed, false)) {
+                usenet.push({
+                    hash: (u.hash || '').toLowerCase(),
+                    nzbUrl: u.nzb,
+                    title: rawTitle,
+                    sizeBytes: u.size || 0,
+                    cached: Boolean(u.cached)
+                });
+            }
+        }
+    }
+
+    return { torrents, usenet };
+}
+
+// 3. Busca em todos os Indexadores Externos (Torrentio, Brazuca, MediaFusion, Comet + Custom)
+async function fetchExternalSources(type, id, customIndexerUrls, onlyDubbed) {
     const activeIndexers = [...DEFAULT_INDEXERS];
     if (customIndexerUrls) {
         const extras = customIndexerUrls.split(',').map(u => u.trim()).filter(Boolean);
@@ -817,35 +889,39 @@ async function fetchCandidateTorrents(type, id, customIndexerUrls, apiKey, metad
     }
 
     const responses = await Promise.allSettled(requests);
+    const torrentCandidates = [];
+    const directHttpStreams = [];
 
     for (const r of responses) {
         if (r.status !== 'fulfilled') continue;
         const { indexer, streams } = r.value;
 
         for (const s of streams) {
-            const hash = extractInfoHash(s);
-            if (!hash) continue;
-
             const fullText = `${s.name || ''} ${s.title || ''} ${s.description || ''}`;
-            if (isPtBrStream(fullText, onlyDubbed, indexer.isNativePtBr)) {
-                const rawTitle = s.title || s.description || s.name || 'Stream PT-BR';
-                results.push({
+            if (!isPtBrStream(fullText, onlyDubbed, indexer.isNativePtBr)) continue;
+
+            const rawTitle = s.title || s.description || s.name || 'Stream PT-BR';
+            const hash = extractInfoHash(s);
+
+            if (hash) {
+                torrentCandidates.push({
                     infoHash: hash,
                     title: rawTitle,
-                    fileIdx: s.fileIdx ?? null,
+                    sizeBytes: 0,
+                    source: indexer.name
+                });
+            } else if (s.url && /^https?:\/\//i.test(s.url)) {
+                // Stream HTTP direto já resolvido pelo provedor
+                directHttpStreams.push({
+                    directUrl: s.url,
+                    title: rawTitle,
                     source: indexer.name
                 });
             }
         }
     }
 
-    const unique = new Map();
-    for (const item of results) {
-        if (item.infoHash && !unique.has(item.infoHash)) {
-            unique.set(item.infoHash, item);
-        }
-    }
-    return Array.from(unique.values());
+    return { torrentCandidates, directHttpStreams };
 }
 
 function selectBestVideoFile(files, season, episode) {
@@ -865,24 +941,28 @@ function selectBestVideoFile(files, season, episode) {
     return videoFiles.reduce((prev, curr) => (curr.size > prev.size ? curr : prev), videoFiles[0]);
 }
 
-// Página de Configuração
+// =========================================================
+// PÁGINA DE CONFIGURAÇÃO (P2P DESATIVADO)
+// =========================================================
+
 app.get(['/', '/configure', '/:config/configure'], (req, res) => {
     res.send(`
     <!DOCTYPE html>
     <html lang="pt-BR">
     <head>
         <meta charset="UTF-8">
-        <title>Stremio PT-BR Pro 3.4</title>
+        <title>TorBox PT-BR All-In-One 4.0</title>
         <style>
             body { font-family: system-ui, sans-serif; background: #0f172a; color: #f8fafc; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 1rem; }
-            .card { background: #1e293b; padding: 2rem; border-radius: 12px; width: 100%; max-width: 500px; box-shadow: 0 10px 25px rgba(0,0,0,0.4); }
+            .card { background: #1e293b; padding: 2rem; border-radius: 12px; width: 100%; max-width: 520px; box-shadow: 0 10px 25px rgba(0,0,0,0.4); }
             h2 { margin-top: 0; color: #4ade80; }
             .badges { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 1rem; }
             .badge { background: #334155; color: #38bdf8; padding: 4px 8px; border-radius: 6px; font-size: 0.75rem; font-weight: bold; }
+            .badge-off { background: #450a0a; color: #fca5a5; }
             label { display: block; margin-top: 1rem; font-size: 0.9rem; color: #cbd5e1; font-weight: 500; }
-            select, input[type="text"], input[type="password"] { width: 100%; padding: 0.75rem; margin-top: 0.4rem; border-radius: 8px; border: 1px solid #334155; background: #0f172a; color: #fff; box-sizing: border-box; font-size: 0.95rem; }
-            .torbox-box { background: #0f172a80; border: 1px solid #334155; padding: 1rem; border-radius: 8px; margin-top: 1rem; }
-            .checkbox-label { display: flex; align-items: center; gap: 8px; margin-top: 0.8rem; cursor: pointer; font-size: 0.9rem; font-weight: normal; }
+            input[type="text"], input[type="password"] { width: 100%; padding: 0.75rem; margin-top: 0.4rem; border-radius: 8px; border: 1px solid #334155; background: #0f172a; color: #fff; box-sizing: border-box; font-size: 0.95rem; }
+            .methods-box { background: #0f172a80; border: 1px solid #334155; padding: 1rem; border-radius: 8px; margin-top: 1rem; }
+            .checkbox-label { display: flex; align-items: center; gap: 8px; margin-top: 0.65rem; cursor: pointer; font-size: 0.9rem; font-weight: normal; }
             .btn { display: block; text-align: center; text-decoration: none; width: 100%; margin-top: 1.2rem; padding: 0.85rem; border: none; border-radius: 8px; font-size: 1rem; font-weight: bold; cursor: pointer; box-sizing: border-box; }
             .btn-green { background: #16a34a; color: white; }
             .btn-green:hover { background: #15803d; }
@@ -893,43 +973,53 @@ app.get(['/', '/configure', '/:config/configure'], (req, res) => {
     </head>
     <body>
         <div class="card">
-            <h2>🎬 Stremio PT-BR Pro 3.4</h2>
+            <h2>⚡ TorBox PT-BR All-In-One 4.0</h2>
             <div class="badges">
-                <span class="badge">Prioridade: Qualidade + Tamanho</span>
-                <span class="badge">Episódios & Sinopses PT-BR</span>
-                <span class="badge">🧲 P2P & ⚡ TorBox</span>
+                <span class="badge">TorBox Torrents</span>
+                <span class="badge">TorBox Usenet (Pro)</span>
+                <span class="badge">TorBox WebDL & Nuvem</span>
+                <span class="badge">Streams HTTP Diretos</span>
+                <span class="badge badge-off">P2P Desativado</span>
             </div>
             
-            <label>Como você deseja assistir?</label>
-            <select id="mode" onchange="updateLinks()">
-                <option value="p2p">🧲 Sem API TorBox (Modo P2P Torrent Gratuito)</option>
-                <option value="torbox">⚡ Usar API do TorBox (Cache Instantâneo Debrid)</option>
-                <option value="hybrid">🔀 Modo Híbrido (Mostrar links TorBox + links P2P)</option>
-            </select>
+            <label>TorBox API Key (Obrigatório para Torrents, Usenet e Nuvem):</label>
+            <input type="password" id="apiKey" placeholder="Cole sua chave da conta TorBox..." oninput="updateLinks()" />
 
-            <div id="torboxSection" class="torbox-box" style="display: none;">
-                <label style="margin-top: 0;">TorBox API Key:</label>
-                <input type="password" id="apiKey" placeholder="Cole sua chave da conta TorBox..." oninput="updateLinks()" />
-                
+            <div class="methods-box">
+                <label style="margin-top: 0; color: #38bdf8;">Meios de Reprodução Ativos:</label>
                 <label class="checkbox-label">
-                    <input type="checkbox" id="cachedOnly" checked onchange="updateLinks()" />
-                    Mostrar apenas streams em cache instantâneo
+                    <input type="checkbox" id="enableTorrents" checked onchange="updateLinks()" />
+                    ⚡ TorBox Torrents (Torrentio, Brazuca, MediaFusion, Comet & TorBox Search)
+                </label>
+                <label class="checkbox-label">
+                    <input type="checkbox" id="enableUsenet" checked onchange="updateLinks()" />
+                    ⚡ TorBox Usenet (Busca NZB Instantânea & Nuvem Usenet Pro)
+                </label>
+                <label class="checkbox-label">
+                    <input type="checkbox" id="enableCloud" checked onchange="updateLinks()" />
+                    ⚡ TorBox Nuvem Pessoal & WebDL (Arquivos salvos na sua conta)
+                </label>
+                <label class="checkbox-label">
+                    <input type="checkbox" id="enableHttp" checked onchange="updateLinks()" />
+                    ⚡ Streams HTTP Diretos (Links HTTPS nativos dos indexadores)
                 </label>
             </div>
-            
-            <label>TMDB API Key (Opcional - Tradução automática já ativa):</label>
-            <input type="text" id="tmdbKey" placeholder="Opcional: episódios e sinopses já são traduzidos!" oninput="updateLinks()" />
 
-            <label>Indexadores Extras Opcionais (separados por vírgula):</label>
-            <input type="text" id="customIndexers" placeholder="Opcional: Torrentio, Brazuca e MediaFusion já inclusos" oninput="updateLinks()" />
+            <label class="checkbox-label" style="margin-top: 1rem;">
+                <input type="checkbox" id="cachedOnly" checked onchange="updateLinks()" />
+                Mostrar apenas streams em cache instantâneo no TorBox
+            </label>
 
             <label class="checkbox-label">
                 <input type="checkbox" id="onlyDubbed" onchange="updateLinks()" />
                 Apenas Dublado / Dual Áudio (Ocultar apenas legendados)
             </label>
+            
+            <label>Indexadores Extras Opcionais (separados por vírgula):</label>
+            <input type="text" id="customIndexers" placeholder="Opcional: Torrentio, Brazuca, MediaFusion e Comet já inclusos" oninput="updateLinks()" />
 
-            <a id="installAppBtn" class="btn btn-green" href="#">🚀 Abrir e Instalar no Stremio</a>
-            <button type="button" class="btn btn-blue" onclick="copyManifestUrl()" id="copyBtn">📋 Copiar Link do Manifesto</button>
+            <button type="button" class="btn btn-blue" onclick="copyManifestUrl()" id="copyBtn">📋 Copiar Link do Manifesto (Multidispositivo)</button>
+            <a id="installAppBtn" class="btn btn-green" href="#">🚀 Abrir e Instalar no App</a>
 
             <div class="url-box" id="manifestUrlDisplay"></div>
         </div>
@@ -937,17 +1027,27 @@ app.get(['/', '/configure', '/:config/configure'], (req, res) => {
             let currentHttpUrl = '';
 
             function updateLinks() {
-                const mode = document.getElementById('mode').value;
-                const tbSection = document.getElementById('torboxSection');
-                tbSection.style.display = (mode === 'p2p') ? 'none' : 'block';
-
-                const apiKey = mode === 'p2p' ? '' : document.getElementById('apiKey').value.trim();
-                const tmdbKey = document.getElementById('tmdbKey').value.trim();
+                const apiKey = document.getElementById('apiKey').value.trim();
                 const indexerUrl = document.getElementById('customIndexers').value.trim();
                 const onlyDubbed = document.getElementById('onlyDubbed').checked;
                 const cachedOnly = document.getElementById('cachedOnly').checked;
+                const enableTorrents = document.getElementById('enableTorrents').checked;
+                const enableUsenet = document.getElementById('enableUsenet').checked;
+                const enableCloud = document.getElementById('enableCloud').checked;
+                const enableHttp = document.getElementById('enableHttp').checked;
 
-                const config = { mode, apiKey, tmdbKey, indexerUrl, onlyDubbed, cachedOnly };
+                const config = {
+                    mode: 'torbox',
+                    apiKey,
+                    indexerUrl,
+                    onlyDubbed,
+                    cachedOnly,
+                    enableTorrents,
+                    enableUsenet,
+                    enableCloud,
+                    enableHttp
+                };
+
                 const encoded = btoa(JSON.stringify(config))
                     .replace(/\\+/g, '-')
                     .replace(/\\//g, '_')
@@ -956,9 +1056,9 @@ app.get(['/', '/configure', '/:config/configure'], (req, res) => {
                 const host = window.location.host;
                 const protocol = window.location.protocol;
                 currentHttpUrl = protocol + '//' + host + '/' + encoded + '/manifest.json';
-                const stremioDeepLink = 'stremio://' + host + '/' + encoded + '/manifest.json';
+                const appDeepLink = 'stremio://' + host + '/' + encoded + '/manifest.json';
 
-                document.getElementById('installAppBtn').href = stremioDeepLink;
+                document.getElementById('installAppBtn').href = appDeepLink;
                 document.getElementById('manifestUrlDisplay').textContent = currentHttpUrl;
             }
 
@@ -967,7 +1067,7 @@ app.get(['/', '/configure', '/:config/configure'], (req, res) => {
                     const btn = document.getElementById('copyBtn');
                     btn.textContent = '✅ Link Copiado!';
                     setTimeout(() => {
-                        btn.textContent = '📋 Copiar Link do Manifesto';
+                        btn.textContent = '📋 Copiar Link do Manifesto (Multidispositivo)';
                     }, 3000);
                 });
             }
@@ -988,8 +1088,7 @@ app.get(['/manifest.json', '/:config/manifest.json', '/*/manifest.json'], (req, 
 
 // Rota de Catálogo
 async function handleCatalogRequest(req, res) {
-    const { config: configStr, type, id: catalogId, extra } = req.params;
-    const config = decodeConfig(configStr);
+    const { type, id: catalogId, extra } = req.params;
 
     const extraObj = {};
     if (extra) {
@@ -1007,7 +1106,7 @@ async function handleCatalogRequest(req, res) {
         return res.json({ metas });
     }
 
-    const metas = await fetchMoviesOrSeriesCatalog(type, catalogId, extraObj, config.tmdbKey);
+    const metas = await fetchMoviesOrSeriesCatalog(type, catalogId, extraObj);
     res.json({ metas });
 }
 
@@ -1046,12 +1145,14 @@ app.get([
     '/:config/meta/:type/:id.json'
 ], handleMetaRequest);
 
-// Rota de Streams (Ordenação Estrita por Qualidade e Tamanho)
+// =========================================================
+// ROTA DE STREAMS (TODOS OS MEIOS ATIVOS • SEM P2P)
+// =========================================================
+
 async function handleStreamRequest(req, res) {
     const { config: configStr, type } = req.params;
     const id = decodeURIComponent(req.params.id || '');
     const config = decodeConfig(configStr);
-    const mode = config.mode || (config.apiKey ? 'torbox' : 'p2p');
 
     const protocol = req.headers['x-forwarded-proto'] || req.protocol;
     const host = `${protocol}://${req.get('host')}`;
@@ -1070,46 +1171,84 @@ async function handleStreamRequest(req, res) {
     }
 
     const metadata = await getMediaMetadata(type, idPrefix, id);
-
     if (idPrefix === 'tt' && metadata.name) {
         addToContinueWatching(type, metadata);
     }
 
-    const activeApiKey = (mode === 'torbox' || mode === 'hybrid') ? config.apiKey : '';
+    const apiKey = (config.apiKey || '').trim();
+    const onlyDubbed = Boolean(config.onlyDubbed);
+    const cachedOnly = config.cachedOnly !== false;
 
-    const candidates = await fetchCandidateTorrents(
-        type,
-        id,
-        config.indexerUrl,
-        activeApiKey,
-        metadata,
-        Boolean(config.onlyDubbed)
-    );
+    const enableTorrents = config.enableTorrents !== false;
+    const enableUsenet = config.enableUsenet !== false;
+    const enableCloud = config.enableCloud !== false;
+    const enableHttp = config.enableHttp !== false;
 
-    if (!candidates.length) {
-        return res.json({ streams: [] });
-    }
+    // Executa todas as buscas em paralelo (Nuvem TorBox, Busca Oficial TorBox, Indexadores Externos)
+    const [cloudItems, tbSearch, externalData] = await Promise.all([
+        (apiKey && enableCloud && metadata.title)
+            ? searchAllUserTorBoxClouds(apiKey, metadata.title, onlyDubbed)
+            : Promise.resolve([]),
+        (apiKey && (enableTorrents || enableUsenet))
+            ? searchTorBoxOfficialApi(apiKey, id, season, episode, onlyDubbed)
+            : Promise.resolve({ torrents: [], usenet: [] }),
+        (enableTorrents || enableHttp)
+            ? fetchExternalSources(type, id, config.indexerUrl, onlyDubbed)
+            : Promise.resolve({ torrentCandidates: [], directHttpStreams: [] })
+    ]);
 
     const scoredStreams = [];
 
-    // 1. TorBox: ⚡ • 1080p - Dublado
-    if ((mode === 'torbox' || mode === 'hybrid') && activeApiKey) {
-        const hashes = candidates.map(c => c.infoHash);
-        const cachedMap = await checkTorBoxCache(activeApiKey, hashes);
-
-        for (const item of candidates) {
-            const isCached = Boolean(cachedMap[item.infoHash]);
-            if (config.cachedOnly && !isCached) continue;
-
-            const info = parseAndFormatStream(item.title, season);
-            const resolveUrl = `${host}/${configStr || 'p2p'}/resolve/${item.infoHash}/${season ?? 0}/${episode ?? 0}`;
+    // MEIO 1: Nuvem Pessoal do Usuário no TorBox (Torrents, Usenet e WebDL já baixados)
+    if (apiKey && enableCloud && cloudItems.length > 0) {
+        for (const item of cloudItems) {
+            const info = parseAndFormatStream(item.title, season, item.sizeBytes);
+            const resolveUrl = `${host}/${configStr}/resolve/cloud/${item.cloudType}/${item.itemId}/${season ?? 0}/${episode ?? 0}`;
 
             scoredStreams.push({
                 name: `⚡ • ${info.resolution} - ${info.audioLabel}`,
                 title: info.formattedDescription,
                 url: resolveUrl,
                 behaviorHints: {
-                    bingeGroup: `torbox-ptbr-${info.resolution}-${isCached ? 'cached' : 'uncached'}`
+                    bingeGroup: `torbox-cloud-${info.resolution}`
+                },
+                _sort: {
+                    cacheRank: 3, // Prioridade máxima para arquivos já na conta do usuário
+                    isRightSeason: info.isRightSeason,
+                    resolutionRank: info.resolutionRank,
+                    sourceQualityRank: info.sourceQualityRank,
+                    sizeInMB: info.sizeInMB,
+                    audioRank: info.audioRank
+                }
+            });
+        }
+    }
+
+    // MEIO 2: TorBox Torrents (Indexadores Externos + TorBox Search API)
+    if (apiKey && enableTorrents) {
+        const mergedTorrentsMap = new Map();
+        for (const t of [...tbSearch.torrents, ...externalData.torrentCandidates]) {
+            if (t.infoHash && !mergedTorrentsMap.has(t.infoHash)) {
+                mergedTorrentsMap.set(t.infoHash, t);
+            }
+        }
+        const allTorrents = Array.from(mergedTorrentsMap.values());
+        const hashes = allTorrents.map(t => t.infoHash);
+        const cachedMap = await checkTorBoxTorrentCache(apiKey, hashes);
+
+        for (const item of allTorrents) {
+            const isCached = Boolean(item.cached || cachedMap[item.infoHash]);
+            if (cachedOnly && !isCached) continue;
+
+            const info = parseAndFormatStream(item.title, season, item.sizeBytes);
+            const resolveUrl = `${host}/${configStr}/resolve/torrent/${item.infoHash}/${season ?? 0}/${episode ?? 0}`;
+
+            scoredStreams.push({
+                name: `⚡ • ${info.resolution} - ${info.audioLabel}`,
+                title: info.formattedDescription,
+                url: resolveUrl,
+                behaviorHints: {
+                    bingeGroup: `torbox-torrent-${info.resolution}-${isCached ? 'cached' : 'uncached'}`
                 },
                 _sort: {
                     cacheRank: isCached ? 2 : 1,
@@ -1123,22 +1262,28 @@ async function handleStreamRequest(req, res) {
         }
     }
 
-    // 2. P2P: 🧲 • 1080p - Dublado
-    if (mode === 'p2p' || mode === 'hybrid' || !activeApiKey) {
-        for (const c of candidates) {
-            const info = parseAndFormatStream(c.title, season);
+    // MEIO 3: TorBox Usenet Pro (NZB Instantâneo)
+    if (apiKey && enableUsenet && tbSearch.usenet.length > 0) {
+        const usenetHashes = tbSearch.usenet.map(u => u.hash).filter(Boolean);
+        const usenetCacheMap = await checkTorBoxUsenetCache(apiKey, usenetHashes);
+
+        for (const uItem of tbSearch.usenet) {
+            const isCached = Boolean(uItem.cached || (uItem.hash && usenetCacheMap[uItem.hash]));
+            if (cachedOnly && !isCached) continue;
+
+            const info = parseAndFormatStream(uItem.title, season, uItem.sizeBytes);
+            const encodedNzb = Buffer.from(uItem.nzbUrl, 'utf8').toString('base64url');
+            const resolveUrl = `${host}/${configStr}/resolve/usenet/${encodedNzb}/${season ?? 0}/${episode ?? 0}`;
 
             scoredStreams.push({
-                name: `🧲 • ${info.resolution} - ${info.audioLabel}`,
+                name: `⚡ • ${info.resolution} - ${info.audioLabel}`,
                 title: info.formattedDescription,
-                infoHash: c.infoHash,
-                ...(c.fileIdx !== null && c.fileIdx !== undefined ? { fileIdx: c.fileIdx } : {}),
-                sources: PUBLIC_TRACKERS,
+                url: resolveUrl,
                 behaviorHints: {
-                    bingeGroup: `p2p-ptbr-${info.resolution}`
+                    bingeGroup: `torbox-usenet-${info.resolution}`
                 },
                 _sort: {
-                    cacheRank: 0,
+                    cacheRank: isCached ? 2 : 1,
                     isRightSeason: info.isRightSeason,
                     resolutionRank: info.resolutionRank,
                     sourceQualityRank: info.sourceQualityRank,
@@ -1149,7 +1294,31 @@ async function handleStreamRequest(req, res) {
         }
     }
 
-    // Aplica a ordenação estrita por Qualidade e Tamanho (do maior para o menor)
+    // MEIO 4: Streams HTTP Diretos de Provedores Externos (Sem P2P)
+    if (enableHttp && externalData.directHttpStreams.length > 0) {
+        for (const d of externalData.directHttpStreams) {
+            const info = parseAndFormatStream(d.title, season, 0);
+
+            scoredStreams.push({
+                name: `⚡ • ${info.resolution} - ${info.audioLabel}`,
+                title: info.formattedDescription,
+                url: d.directUrl,
+                behaviorHints: {
+                    bingeGroup: `direct-http-${info.resolution}`
+                },
+                _sort: {
+                    cacheRank: 2,
+                    isRightSeason: info.isRightSeason,
+                    resolutionRank: info.resolutionRank,
+                    sourceQualityRank: info.sourceQualityRank,
+                    sizeInMB: info.sizeInMB,
+                    audioRank: info.audioRank
+                }
+            });
+        }
+    }
+
+    // Ordena rigorosamente por Qualidade (4K -> 1080p -> 720p, BluRay -> WEB-DL) e Tamanho (Maior -> Menor)
     scoredStreams.sort(compareStreamsByQualityAndSize);
 
     const finalStreams = scoredStreams.map(({ _sort, ...stream }) => stream);
@@ -1161,7 +1330,15 @@ app.get([
     '/:config/stream/:type/:id.json'
 ], handleStreamRequest);
 
-app.get('/:config/resolve/:infoHash/:season/:episode', async (req, res) => {
+// =========================================================
+// RESOLVEDORES ON-DEMAND (TORRENTS, USENET E NUVEM/WEBDL)
+// =========================================================
+
+// 1. Resolvedor de Torrents (Magnet/InfoHash -> Link Direto TorBox)
+app.get([
+    '/:config/resolve/torrent/:infoHash/:season/:episode',
+    '/:config/resolve/:infoHash/:season/:episode'
+], async (req, res) => {
     const { config: configStr, infoHash, season, episode } = req.params;
     const config = decodeConfig(configStr);
 
@@ -1208,9 +1385,102 @@ app.get('/:config/resolve/:infoHash/:season/:episode', async (req, res) => {
 
         const redirectDlUrl = `${TORBOX_API}/torrents/requestdl?token=${encodeURIComponent(config.apiKey)}&torrent_id=${torrentId}&file_id=${targetFile.id}&redirect=true`;
         return res.redirect(302, redirectDlUrl);
-
     } catch {
-        res.status(500).send('Erro ao resolver link junto à API do TorBox.');
+        res.status(500).send('Erro ao resolver torrent junto à API do TorBox.');
+    }
+});
+
+// 2. Resolvedor de Usenet (NZB -> Link Direto TorBox)
+app.get('/:config/resolve/usenet/:encodedNzb/:season/:episode', async (req, res) => {
+    const { config: configStr, encodedNzb, season, episode } = req.params;
+    const config = decodeConfig(configStr);
+
+    if (!config.apiKey) {
+        return res.status(400).send('API Key do TorBox não configurada.');
+    }
+
+    try {
+        const nzbUrl = Buffer.from(encodedNzb, 'base64url').toString('utf8');
+        const form = new FormData();
+        form.append('link', nzbUrl);
+
+        const createRes = await axios.post(`${TORBOX_API}/usenet/createusenetdownload`, form, {
+            headers: {
+                ...form.getHeaders(),
+                Authorization: `Bearer ${config.apiKey}`
+            },
+            timeout: 15000
+        });
+
+        const usenetId = createRes.data?.data?.usenetdownload_id;
+        if (!usenetId) {
+            return res.status(404).send('Não foi possível criar o download Usenet no TorBox.');
+        }
+
+        const listRes = await axios.get(`${TORBOX_API}/usenet/mylist`, {
+            headers: { Authorization: `Bearer ${config.apiKey}` },
+            params: { id: usenetId, bypass_cache: true },
+            timeout: 10000
+        });
+
+        const usenetData = listRes.data?.data;
+        const files = usenetData?.files || [];
+
+        const sNum = parseInt(season, 10) > 0 ? parseInt(season, 10) : null;
+        const eNum = parseInt(episode, 10) > 0 ? parseInt(episode, 10) : null;
+
+        const targetFile = selectBestVideoFile(files, sNum, eNum);
+        if (!targetFile) {
+            return res.status(404).send('Nenhum arquivo de vídeo compatível encontrado na Usenet.');
+        }
+
+        const redirectDlUrl = `${TORBOX_API}/usenet/requestdl?token=${encodeURIComponent(config.apiKey)}&usenet_id=${usenetId}&file_id=${targetFile.id}&redirect=true`;
+        return res.redirect(302, redirectDlUrl);
+    } catch {
+        res.status(500).send('Erro ao resolver Usenet junto à API do TorBox.');
+    }
+});
+
+// 3. Resolvedor de Nuvem Pessoal (Torrents, Usenet e WebDL salvos na conta)
+app.get('/:config/resolve/cloud/:cloudType/:itemId/:season/:episode', async (req, res) => {
+    const { config: configStr, cloudType, itemId, season, episode } = req.params;
+    const config = decodeConfig(configStr);
+
+    if (!config.apiKey) {
+        return res.status(400).send('API Key do TorBox não configurada.');
+    }
+
+    try {
+        const endpointMap = {
+            torrents: { list: 'torrents/mylist', dl: 'torrents/requestdl', idParam: 'torrent_id' },
+            usenet: { list: 'usenet/mylist', dl: 'usenet/requestdl', idParam: 'usenet_id' },
+            webdl: { list: 'webdl/mylist', dl: 'webdl/requestdl', idParam: 'web_id' }
+        };
+
+        const target = endpointMap[cloudType];
+        if (!target) return res.status(400).send('Tipo de nuvem inválido.');
+
+        const listRes = await axios.get(`${TORBOX_API}/${target.list}`, {
+            headers: { Authorization: `Bearer ${config.apiKey}` },
+            params: { id: itemId, bypass_cache: true },
+            timeout: 10000
+        });
+
+        const itemData = listRes.data?.data;
+        const files = itemData?.files || [];
+
+        const sNum = parseInt(season, 10) > 0 ? parseInt(season, 10) : null;
+        const eNum = parseInt(episode, 10) > 0 ? parseInt(episode, 10) : null;
+
+        const targetFile = selectBestVideoFile(files, sNum, eNum);
+        if (!targetFile) {
+            return res.status(404).send('Nenhum arquivo de vídeo encontrado na nuvem.');
+        }
+
+        const redirectDlUrl = `${TORBOX_API}/${target.dl}?token=${encodeURIComponent(config.apiKey)}&${target.idParam}=${itemId}&file_id=${targetFile.id}&redirect=true`;
+        return res.redirect(302, redirectDlUrl);
+    } catch {
+        res.status(500).send('Erro ao resolver arquivo da nuvem TorBox.');
     }
 });
 
