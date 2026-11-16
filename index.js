@@ -156,7 +156,7 @@ async function translateBatchToPtBr(texts = []) {
 }
 
 // =========================================================
-// HISTÓRICO "CONTINUE ASSISTINDO" E INDEXADORES
+// HISTÓRICO "CONTINUE ASSISTINDO" E PROVEDORES HTTP/TORBOX
 // =========================================================
 
 const recentlyWatched = {
@@ -183,6 +183,21 @@ function addToContinueWatching(type, metaObj) {
     if (list.length > 20) list.pop();
 }
 
+// Provedores de Streams HTTP Diretos (Funcionam SEM TorBox e SEM P2P)
+const FREE_HTTP_PROVIDERS = [
+    {
+        name: 'WebStreamr HTTP',
+        url: 'https://webstreamr.hayd.uk',
+        acceptAllStreams: true
+    },
+    {
+        name: 'AutoStream HTTP',
+        url: 'https://autostream.elfhosted.com',
+        acceptAllStreams: true
+    }
+];
+
+// Indexadores de Torrents (Usados quando a chave TorBox está preenchida ou quando fornecem URL HTTP direta)
 const DEFAULT_INDEXERS = [
     {
         name: 'Torrentio',
@@ -222,21 +237,22 @@ const GENRE_OPTIONS = [
 ];
 
 function decodeConfig(configStr) {
-    if (!configStr || configStr === 'configure') return { mode: 'torbox' };
+    if (!configStr || configStr === 'configure') return { mode: 'http_free' };
     try {
         const b64 = configStr.replace(/-/g, '+').replace(/_/g, '/');
         return JSON.parse(Buffer.from(b64, 'base64').toString('utf8'));
     } catch {
-        return { mode: 'torbox' };
+        return { mode: 'http_free' };
     }
 }
 
 function buildManifest(config = {}) {
+    const hasTorbox = Boolean(config.apiKey);
     return {
         id: 'org.community.torbox.ptbr.pro',
-        version: '4.0.0',
-        name: config.apiKey ? 'TorBox PT-BR All-In-One' : 'TorBox PT-BR (Configurar API)',
-        description: 'Todos os meios TorBox (Torrents Cache, Usenet Pro, WebDL e Nuvem Pessoal) + Catálogos e Episódios em PT-BR (P2P Desativado).',
+        version: '4.1.0',
+        name: hasTorbox ? 'PT-BR Pro (TorBox + HTTP)' : 'PT-BR Pro (Streams Diretos Sem TorBox)',
+        description: 'Streams HTTP Diretos Gratuitos (Sem TorBox e Sem P2P) + Suporte opcional a TorBox API, Catálogos e Episódios em PT-BR.',
         resources: ['catalog', 'meta', 'stream'],
         types: ['movie', 'series', 'anime'],
         idPrefixes: ['tt', 'kitsu'],
@@ -330,14 +346,14 @@ function formatBytesToSizeText(bytes) {
     return `${mb.toFixed(2)} MB`;
 }
 
-function parseAndFormatStream(rawTitle = '', season = null, explicitBytes = 0) {
+function parseAndFormatStream(rawTitle = '', season = null, explicitBytes = 0, fallbackSizeLabel = 'Stream Direto') {
     const sizeMatch = rawTitle.match(/(?:💾\s*)?(\d+(?:[.,]\d+)?)\s*(GB|MB|GiB|MiB)/i);
-    let sizeText = 'Tamanho N/D';
+    let sizeText = fallbackSizeLabel;
     let sizeInMB = 0;
 
     if (explicitBytes && explicitBytes > 0) {
         sizeInMB = explicitBytes / (1024 * 1024);
-        sizeText = formatBytesToSizeText(explicitBytes) || 'Tamanho N/D';
+        sizeText = formatBytesToSizeText(explicitBytes) || fallbackSizeLabel;
     } else if (sizeMatch) {
         const rawValue = parseFloat(sizeMatch[1].replace(',', '.'));
         const rawUnit = sizeMatch[2].toUpperCase().replace('GIB', 'GB').replace('MIB', 'MB');
@@ -357,8 +373,8 @@ function parseAndFormatStream(rawTitle = '', season = null, explicitBytes = 0) {
         }
     }
 
-    let resolution = 'HD';
-    let resolutionRank = 2;
+    let resolution = '1080p';
+    let resolutionRank = 4;
     if (/\b(2160p|4k|uhd)\b/i.test(rawTitle)) {
         resolution = '4K';
         resolutionRank = 5;
@@ -368,7 +384,7 @@ function parseAndFormatStream(rawTitle = '', season = null, explicitBytes = 0) {
     } else if (/\b(720p|hd)\b/i.test(rawTitle)) {
         resolution = '720p';
         resolutionRank = 3;
-    } else if (/\b(480p|360p)\b/i.test(rawTitle)) {
+    } else if (/\b(480p|360p|sd)\b/i.test(rawTitle)) {
         resolution = '480p';
         resolutionRank = 1;
     }
@@ -391,7 +407,7 @@ function parseAndFormatStream(rawTitle = '', season = null, explicitBytes = 0) {
     if (/\b(hdr|hdr10|dv|dolby\s*vision)\b/i.test(rawTitle)) sourceQualityRank += 5;
     if (/\b(hevc|x265|10bit)\b/i.test(rawTitle)) sourceQualityRank += 2;
 
-    const isDubOrDual = /(\bdublado\b|\bdub\b|\bdual[-_. ]?audio\b|\bdual\b|\bnacional\b)/i.test(rawTitle);
+    const isDubOrDual = /(\bdublado\b|\bdub\b|\bdual[-_. ]?audio\b|\bdual\b|\bnacional\b|🇧🇷)/i.test(rawTitle);
     const audioLabel = isDubOrDual ? 'Dublado' : 'Legendado';
     const audioRank = isDubOrDual ? 2 : 1;
 
@@ -457,6 +473,98 @@ function extractInfoHash(streamObj) {
     const rawText = `${streamObj.url || ''} ${streamObj.externalUrl || ''} ${JSON.stringify(streamObj.sources || [])}`;
     const match = rawText.match(/\b([a-fA-F0-9]{40})\b/);
     return match ? match[1].toLowerCase() : null;
+}
+
+// =========================================================
+// MOTORES GRATUITOS DE STREAMING DIRETO (SEM TORBOX E SEM P2P)
+// =========================================================
+
+// 1. Busca Animes em MP4 HTTP Direto (AnimeFire PT-BR Dublado & Legendado)
+function slugifyTitle(title = '') {
+    return title
+        .toLowerCase()
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/(^-|-$)/g, '');
+}
+
+async function fetchDirectAnimePtBrStreams(title, episode = 1, onlyDubbed = false) {
+    if (!title) return [];
+    const baseSlug = slugifyTitle(title);
+    if (!baseSlug) return [];
+
+    const epNum = episode || 1;
+    const variants = onlyDubbed
+        ? [{ slug: `${baseSlug}-dublado`, label: 'Dublado' }]
+        : [
+            { slug: `${baseSlug}-dublado`, label: 'Dublado' },
+            { slug: `${baseSlug}-todos-os-episodios`, label: 'Legendado' },
+            { slug: baseSlug, label: 'Legendado' }
+        ];
+
+    const directStreams = [];
+
+    await Promise.allSettled(
+        variants.map(async (v) => {
+            try {
+                const apiUrl = `https://animefire.plus/video/${v.slug}/${epNum}`;
+                const res = await axios.get(apiUrl, {
+                    headers: { 'User-Agent': 'Mozilla/5.0' },
+                    timeout: 5500
+                });
+                const items = res.data?.data || [];
+                for (const item of items) {
+                    if (item.src && /^https?:\/\//i.test(item.src)) {
+                        const resLabel = item.label || '720p';
+                        directStreams.push({
+                            directUrl: item.src,
+                            title: `${title} ${resLabel} WEB-DL ${v.label} PT-BR`,
+                            sizeLabel: `HTTP Direto (${resLabel})`
+                        });
+                    }
+                }
+            } catch {}
+        })
+    );
+
+    return directStreams;
+}
+
+// 2. Busca em Provedores de Streaming HTTP Gratuitos (WebStreamr, AutoStream, etc.)
+async function fetchFreeHttpProviders(type, id, onlyDubbed) {
+    const queryType = id.startsWith('kitsu') ? 'series' : type;
+    const requests = FREE_HTTP_PROVIDERS.map(provider => {
+        const url = `${provider.url.replace(/\/$/, '')}/stream/${queryType}/${encodeURIComponent(id)}.json`;
+        return axios.get(url, { timeout: 7000 })
+            .then(res => ({ provider, streams: res.data?.streams || [] }))
+            .catch(() => ({ provider, streams: [] }));
+    });
+
+    const responses = await Promise.allSettled(requests);
+    const httpStreams = [];
+
+    for (const r of responses) {
+        if (r.status !== 'fulfilled') continue;
+        const { provider, streams } = r.value;
+
+        for (const s of streams) {
+            // Garante que NÃO é P2P (ignora infoHash e exige URL https:// direta)
+            if (s.infoHash || !s.url || !/^https?:\/\//i.test(s.url)) continue;
+
+            const fullText = `${s.name || ''} ${s.title || ''} ${s.description || ''}`;
+            if (onlyDubbed && !isPtBrStream(fullText, true, false)) continue;
+
+            httpStreams.push({
+                directUrl: s.url,
+                title: `${fullText} WEB-DL`,
+                sizeLabel: `${provider.name}`,
+                behaviorHints: s.behaviorHints || {}
+            });
+        }
+    }
+
+    return httpStreams;
 }
 
 // =========================================================
@@ -734,7 +842,7 @@ async function getMediaMetadata(type, idPrefix, rawId) {
 }
 
 // =========================================================
-// TODOS OS MEIOS DE ASSISTIR (TORBOX TORRENTS, USENET, WEBDL & HTTP)
+// FUNÇÕES TORBOX (ATIVADAS QUANDO A CHAVE ESTÁ PRESENTE)
 // =========================================================
 
 async function checkTorBoxTorrentCache(apiKey, hashes) {
@@ -767,7 +875,6 @@ async function checkTorBoxUsenetCache(apiKey, hashes) {
     }
 }
 
-// 1. Busca em TODAS as Nuvens Pessoais do usuário no TorBox (Torrents + Usenet + WebDL)
 async function searchAllUserTorBoxClouds(apiKey, queryTitle, onlyDubbed) {
     if (!apiKey || !queryTitle) return [];
     const normalizedQuery = queryTitle.toLowerCase();
@@ -790,7 +897,7 @@ async function searchAllUserTorBoxClouds(apiKey, queryTitle, onlyDubbed) {
             if (matchesTitle && isPtBrStream(item.name, onlyDubbed, true)) {
                 cloudStreams.push({
                     kind: 'cloud',
-                    cloudType, // 'torrents', 'usenet', 'webdl'
+                    cloudType,
                     itemId: item.id,
                     title: item.name,
                     sizeBytes: item.size || 0
@@ -806,7 +913,6 @@ async function searchAllUserTorBoxClouds(apiKey, queryTitle, onlyDubbed) {
     return cloudStreams;
 }
 
-// 2. Busca na API Oficial de Pesquisa do TorBox (Torrents + Usenet Pro)
 async function searchTorBoxOfficialApi(apiKey, rawId, season, episode, onlyDubbed) {
     if (!apiKey) return { torrents: [], usenet: [] };
 
@@ -861,7 +967,6 @@ async function searchTorBoxOfficialApi(apiKey, rawId, season, episode, onlyDubbe
     return { torrents, usenet };
 }
 
-// 3. Busca em todos os Indexadores Externos (Torrentio, Brazuca, MediaFusion, Comet + Custom)
 async function fetchExternalSources(type, id, customIndexerUrls, onlyDubbed) {
     const activeIndexers = [...DEFAULT_INDEXERS];
     if (customIndexerUrls) {
@@ -911,11 +1016,10 @@ async function fetchExternalSources(type, id, customIndexerUrls, onlyDubbed) {
                     source: indexer.name
                 });
             } else if (s.url && /^https?:\/\//i.test(s.url)) {
-                // Stream HTTP direto já resolvido pelo provedor
                 directHttpStreams.push({
                     directUrl: s.url,
                     title: rawTitle,
-                    source: indexer.name
+                    sizeLabel: `HTTP Direto (${indexer.name})`
                 });
             }
         }
@@ -942,7 +1046,7 @@ function selectBestVideoFile(files, season, episode) {
 }
 
 // =========================================================
-// PÁGINA DE CONFIGURAÇÃO (P2P DESATIVADO)
+// PÁGINA DE CONFIGURAÇÃO (SEM P2P • FUNCIONA SEM TORBOX)
 // =========================================================
 
 app.get(['/', '/configure', '/:config/configure'], (req, res) => {
@@ -951,7 +1055,7 @@ app.get(['/', '/configure', '/:config/configure'], (req, res) => {
     <html lang="pt-BR">
     <head>
         <meta charset="UTF-8">
-        <title>TorBox PT-BR All-In-One 4.0</title>
+        <title>PT-BR Pro 4.1 (Streams Diretos & TorBox)</title>
         <style>
             body { font-family: system-ui, sans-serif; background: #0f172a; color: #f8fafc; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 1rem; }
             .card { background: #1e293b; padding: 2rem; border-radius: 12px; width: 100%; max-width: 520px; box-shadow: 0 10px 25px rgba(0,0,0,0.4); }
@@ -973,52 +1077,45 @@ app.get(['/', '/configure', '/:config/configure'], (req, res) => {
     </head>
     <body>
         <div class="card">
-            <h2>⚡ TorBox PT-BR All-In-One 4.0</h2>
+            <h2>⚡ PT-BR Pro 4.1 (Sem P2P)</h2>
             <div class="badges">
-                <span class="badge">TorBox Torrents</span>
-                <span class="badge">TorBox Usenet (Pro)</span>
-                <span class="badge">TorBox WebDL & Nuvem</span>
-                <span class="badge">Streams HTTP Diretos</span>
+                <span class="badge">Funciona Sem TorBox (HTTP Gratuito)</span>
+                <span class="badge">Suporte TorBox API</span>
                 <span class="badge badge-off">P2P Desativado</span>
             </div>
             
-            <label>TorBox API Key (Obrigatório para Torrents, Usenet e Nuvem):</label>
-            <input type="password" id="apiKey" placeholder="Cole sua chave da conta TorBox..." oninput="updateLinks()" />
+            <label>TorBox API Key (Opcional — Deixe em branco para testar sem TorBox):</label>
+            <input type="password" id="apiKey" placeholder="Deixe vazio para usar apenas Streams HTTP Gratuitos..." oninput="updateLinks()" />
 
             <div class="methods-box">
-                <label style="margin-top: 0; color: #38bdf8;">Meios de Reprodução Ativos:</label>
+                <label style="margin-top: 0; color: #38bdf8;">Meios de Reprodução Ativos (Sem P2P):</label>
+                <label class="checkbox-label">
+                    <input type="checkbox" id="enableHttp" checked onchange="updateLinks()" />
+                    🌐 Streams HTTP Diretos Gratuitos (WebStreamr, AnimeFire MP4 & Links HTTPS)
+                </label>
                 <label class="checkbox-label">
                     <input type="checkbox" id="enableTorrents" checked onchange="updateLinks()" />
-                    ⚡ TorBox Torrents (Torrentio, Brazuca, MediaFusion, Comet & TorBox Search)
+                    ⚡ TorBox Torrents (Ativo se preencher a API Key acima)
                 </label>
                 <label class="checkbox-label">
                     <input type="checkbox" id="enableUsenet" checked onchange="updateLinks()" />
-                    ⚡ TorBox Usenet (Busca NZB Instantânea & Nuvem Usenet Pro)
+                    ⚡ TorBox Usenet Pro (Ativo se preencher a API Key acima)
                 </label>
                 <label class="checkbox-label">
                     <input type="checkbox" id="enableCloud" checked onchange="updateLinks()" />
-                    ⚡ TorBox Nuvem Pessoal & WebDL (Arquivos salvos na sua conta)
-                </label>
-                <label class="checkbox-label">
-                    <input type="checkbox" id="enableHttp" checked onchange="updateLinks()" />
-                    ⚡ Streams HTTP Diretos (Links HTTPS nativos dos indexadores)
+                    ⚡ TorBox Nuvem Pessoal & WebDL (Ativo se preencher a API Key acima)
                 </label>
             </div>
 
             <label class="checkbox-label" style="margin-top: 1rem;">
-                <input type="checkbox" id="cachedOnly" checked onchange="updateLinks()" />
-                Mostrar apenas streams em cache instantâneo no TorBox
-            </label>
-
-            <label class="checkbox-label">
                 <input type="checkbox" id="onlyDubbed" onchange="updateLinks()" />
-                Apenas Dublado / Dual Áudio (Ocultar apenas legendados)
+                Apenas Dublado / Dual Áudio (Desmarque para ver mais opções HTTP gratuitas)
             </label>
             
-            <label>Indexadores Extras Opcionais (separados por vírgula):</label>
-            <input type="text" id="customIndexers" placeholder="Opcional: Torrentio, Brazuca, MediaFusion e Comet já inclusos" oninput="updateLinks()" />
+            <label>Provedores HTTP / Indexadores Extras (Opcional):</label>
+            <input type="text" id="customIndexers" placeholder="Opcional: URLs compatíveis separadas por vírgula" oninput="updateLinks()" />
 
-            <button type="button" class="btn btn-blue" onclick="copyManifestUrl()" id="copyBtn">📋 Copiar Link do Manifesto (Multidispositivo)</button>
+            <button type="button" class="btn btn-blue" onclick="copyManifestUrl()" id="copyBtn">📋 Copiar Link do Manifesto</button>
             <a id="installAppBtn" class="btn btn-green" href="#">🚀 Abrir e Instalar no App</a>
 
             <div class="url-box" id="manifestUrlDisplay"></div>
@@ -1030,18 +1127,17 @@ app.get(['/', '/configure', '/:config/configure'], (req, res) => {
                 const apiKey = document.getElementById('apiKey').value.trim();
                 const indexerUrl = document.getElementById('customIndexers').value.trim();
                 const onlyDubbed = document.getElementById('onlyDubbed').checked;
-                const cachedOnly = document.getElementById('cachedOnly').checked;
                 const enableTorrents = document.getElementById('enableTorrents').checked;
                 const enableUsenet = document.getElementById('enableUsenet').checked;
                 const enableCloud = document.getElementById('enableCloud').checked;
                 const enableHttp = document.getElementById('enableHttp').checked;
 
                 const config = {
-                    mode: 'torbox',
+                    mode: apiKey ? 'torbox' : 'http_free',
                     apiKey,
                     indexerUrl,
                     onlyDubbed,
-                    cachedOnly,
+                    cachedOnly: true,
                     enableTorrents,
                     enableUsenet,
                     enableCloud,
@@ -1067,7 +1163,7 @@ app.get(['/', '/configure', '/:config/configure'], (req, res) => {
                     const btn = document.getElementById('copyBtn');
                     btn.textContent = '✅ Link Copiado!';
                     setTimeout(() => {
-                        btn.textContent = '📋 Copiar Link do Manifesto (Multidispositivo)';
+                        btn.textContent = '📋 Copiar Link do Manifesto';
                     }, 3000);
                 });
             }
@@ -1146,7 +1242,7 @@ app.get([
 ], handleMetaRequest);
 
 // =========================================================
-// ROTA DE STREAMS (TODOS OS MEIOS ATIVOS • SEM P2P)
+// ROTA DE STREAMS (FUNCIONA SEM TORBOX E SEM P2P)
 // =========================================================
 
 async function handleStreamRequest(req, res) {
@@ -1184,22 +1280,66 @@ async function handleStreamRequest(req, res) {
     const enableCloud = config.enableCloud !== false;
     const enableHttp = config.enableHttp !== false;
 
-    // Executa todas as buscas em paralelo (Nuvem TorBox, Busca Oficial TorBox, Indexadores Externos)
-    const [cloudItems, tbSearch, externalData] = await Promise.all([
+    // Busca em paralelo: Fontes HTTP Gratuitas (Sem TorBox) + Fontes TorBox (se houver chave)
+    const [
+        freeHttpStreams,
+        animeDirectStreams,
+        externalData,
+        cloudItems,
+        tbSearch
+    ] = await Promise.all([
+        enableHttp
+            ? fetchFreeHttpProviders(type, id, onlyDubbed)
+            : Promise.resolve([]),
+        (enableHttp && (type === 'anime' || idPrefix === 'kitsu'))
+            ? fetchDirectAnimePtBrStreams(metadata.title, episode || 1, onlyDubbed)
+            : Promise.resolve([]),
+        (enableTorrents || enableHttp)
+            ? fetchExternalSources(type, id, config.indexerUrl, onlyDubbed)
+            : Promise.resolve({ torrentCandidates: [], directHttpStreams: [] }),
         (apiKey && enableCloud && metadata.title)
             ? searchAllUserTorBoxClouds(apiKey, metadata.title, onlyDubbed)
             : Promise.resolve([]),
         (apiKey && (enableTorrents || enableUsenet))
             ? searchTorBoxOfficialApi(apiKey, id, season, episode, onlyDubbed)
-            : Promise.resolve({ torrents: [], usenet: [] }),
-        (enableTorrents || enableHttp)
-            ? fetchExternalSources(type, id, config.indexerUrl, onlyDubbed)
-            : Promise.resolve({ torrentCandidates: [], directHttpStreams: [] })
+            : Promise.resolve({ torrents: [], usenet: [] })
     ]);
 
     const scoredStreams = [];
 
-    // MEIO 1: Nuvem Pessoal do Usuário no TorBox (Torrents, Usenet e WebDL já baixados)
+    // 1. STREAMS HTTP DIRETOS GRATUITOS (Funcionam SEM TorBox e SEM P2P!)
+    if (enableHttp) {
+        const allDirectHttp = [
+            ...animeDirectStreams,
+            ...externalData.directHttpStreams,
+            ...freeHttpStreams
+        ];
+
+        for (const d of allDirectHttp) {
+            const info = parseAndFormatStream(d.title, season, 0, d.sizeLabel || 'Stream Direto');
+
+            scoredStreams.push({
+                name: `⚡ • ${info.resolution} - ${info.audioLabel}`,
+                title: info.formattedDescription,
+                url: d.directUrl,
+                behaviorHints: {
+                    notWebReady: false,
+                    bingeGroup: `http-direct-${info.resolution}`,
+                    ...(d.behaviorHints || {})
+                },
+                _sort: {
+                    cacheRank: 2,
+                    isRightSeason: info.isRightSeason,
+                    resolutionRank: info.resolutionRank,
+                    sourceQualityRank: info.sourceQualityRank,
+                    sizeInMB: info.sizeInMB,
+                    audioRank: info.audioRank
+                }
+            });
+        }
+    }
+
+    // 2. NUVEM PESSOAL TORBOX (Se o usuário colocou API Key)
     if (apiKey && enableCloud && cloudItems.length > 0) {
         for (const item of cloudItems) {
             const info = parseAndFormatStream(item.title, season, item.sizeBytes);
@@ -1213,7 +1353,7 @@ async function handleStreamRequest(req, res) {
                     bingeGroup: `torbox-cloud-${info.resolution}`
                 },
                 _sort: {
-                    cacheRank: 3, // Prioridade máxima para arquivos já na conta do usuário
+                    cacheRank: 3,
                     isRightSeason: info.isRightSeason,
                     resolutionRank: info.resolutionRank,
                     sourceQualityRank: info.sourceQualityRank,
@@ -1224,7 +1364,7 @@ async function handleStreamRequest(req, res) {
         }
     }
 
-    // MEIO 2: TorBox Torrents (Indexadores Externos + TorBox Search API)
+    // 3. TORBOX TORRENTS (Se o usuário colocou API Key)
     if (apiKey && enableTorrents) {
         const mergedTorrentsMap = new Map();
         for (const t of [...tbSearch.torrents, ...externalData.torrentCandidates]) {
@@ -1262,7 +1402,7 @@ async function handleStreamRequest(req, res) {
         }
     }
 
-    // MEIO 3: TorBox Usenet Pro (NZB Instantâneo)
+    // 4. TORBOX USENET PRO (Se o usuário colocou API Key)
     if (apiKey && enableUsenet && tbSearch.usenet.length > 0) {
         const usenetHashes = tbSearch.usenet.map(u => u.hash).filter(Boolean);
         const usenetCacheMap = await checkTorBoxUsenetCache(apiKey, usenetHashes);
@@ -1294,31 +1434,7 @@ async function handleStreamRequest(req, res) {
         }
     }
 
-    // MEIO 4: Streams HTTP Diretos de Provedores Externos (Sem P2P)
-    if (enableHttp && externalData.directHttpStreams.length > 0) {
-        for (const d of externalData.directHttpStreams) {
-            const info = parseAndFormatStream(d.title, season, 0);
-
-            scoredStreams.push({
-                name: `⚡ • ${info.resolution} - ${info.audioLabel}`,
-                title: info.formattedDescription,
-                url: d.directUrl,
-                behaviorHints: {
-                    bingeGroup: `direct-http-${info.resolution}`
-                },
-                _sort: {
-                    cacheRank: 2,
-                    isRightSeason: info.isRightSeason,
-                    resolutionRank: info.resolutionRank,
-                    sourceQualityRank: info.sourceQualityRank,
-                    sizeInMB: info.sizeInMB,
-                    audioRank: info.audioRank
-                }
-            });
-        }
-    }
-
-    // Ordena rigorosamente por Qualidade (4K -> 1080p -> 720p, BluRay -> WEB-DL) e Tamanho (Maior -> Menor)
+    // Ordena por Qualidade e Tamanho
     scoredStreams.sort(compareStreamsByQualityAndSize);
 
     const finalStreams = scoredStreams.map(({ _sort, ...stream }) => stream);
@@ -1331,10 +1447,9 @@ app.get([
 ], handleStreamRequest);
 
 // =========================================================
-// RESOLVEDORES ON-DEMAND (TORRENTS, USENET E NUVEM/WEBDL)
+// RESOLVEDORES ON-DEMAND TORBOX
 // =========================================================
 
-// 1. Resolvedor de Torrents (Magnet/InfoHash -> Link Direto TorBox)
 app.get([
     '/:config/resolve/torrent/:infoHash/:season/:episode',
     '/:config/resolve/:infoHash/:season/:episode'
@@ -1390,7 +1505,6 @@ app.get([
     }
 });
 
-// 2. Resolvedor de Usenet (NZB -> Link Direto TorBox)
 app.get('/:config/resolve/usenet/:encodedNzb/:season/:episode', async (req, res) => {
     const { config: configStr, encodedNzb, season, episode } = req.params;
     const config = decodeConfig(configStr);
@@ -1441,7 +1555,6 @@ app.get('/:config/resolve/usenet/:encodedNzb/:season/:episode', async (req, res)
     }
 });
 
-// 3. Resolvedor de Nuvem Pessoal (Torrents, Usenet e WebDL salvos na conta)
 app.get('/:config/resolve/cloud/:cloudType/:itemId/:season/:episode', async (req, res) => {
     const { config: configStr, cloudType, itemId, season, episode } = req.params;
     const config = decodeConfig(configStr);
