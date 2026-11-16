@@ -15,6 +15,30 @@ app.use((req, res, next) => {
 const PORT = process.env.PORT || 7000;
 const TORBOX_API = 'https://api.torbox.app/v1/api';
 
+// Histórico em memória para alimentar a fileira "Continue Assistindo"
+const recentlyWatched = {
+    movie: [],
+    series: []
+};
+
+function addToContinueWatching(type, metaObj) {
+    if (!metaObj || !metaObj.id || !metaObj.name) return;
+    const targetType = type === 'movie' ? 'movie' : 'series';
+    const list = recentlyWatched[targetType];
+    const existingIdx = list.findIndex(item => item.id === metaObj.id);
+    if (existingIdx !== -1) list.splice(existingIdx, 1);
+    list.unshift({
+        id: metaObj.id,
+        type: targetType,
+        name: metaObj.name,
+        poster: metaObj.poster || `https://images.metahub.space/poster/medium/${metaObj.id.split(':')[0]}/img`,
+        background: metaObj.background || `https://images.metahub.space/background/medium/${metaObj.id.split(':')[0]}/img`,
+        description: metaObj.description || '',
+        releaseInfo: metaObj.releaseInfo || ''
+    });
+    if (list.length > 20) list.pop();
+}
+
 const PUBLIC_TRACKERS = [
     'dht:6881',
     'tracker:udp://tracker.opentrackr.org:1337/announce',
@@ -43,6 +67,21 @@ const DEFAULT_INDEXERS = [
     }
 ];
 
+const GENRE_OPTIONS = [
+    'Action',
+    'Adventure',
+    'Animation',
+    'Comedy',
+    'Crime',
+    'Drama',
+    'Fantasy',
+    'Horror',
+    'Mystery',
+    'Romance',
+    'Sci-Fi',
+    'Thriller'
+];
+
 function decodeConfig(configStr) {
     if (!configStr || configStr === 'configure') return { mode: 'p2p' };
     try {
@@ -62,30 +101,75 @@ function buildManifest(config = {}) {
 
     return {
         id: 'org.community.torbox.ptbr.pro',
-        version: '2.5.1',
+        version: '3.0.0',
         name: addonName,
-        description: 'Catálogos e Streams de Filmes, Séries e Animes em PT-BR (4K/1080p/720p) com TorBox e P2P.',
-        resources: ['catalog', 'stream'],
+        description: 'Catálogos completos (Recomendados, Continue Assistindo, Em Alta) e Streams em PT-BR com TorBox e P2P.',
+        resources: [
+            'catalog',
+            { name: 'meta', types: ['anime', 'series'], idPrefixes: ['kitsu'] },
+            'stream'
+        ],
         types: ['movie', 'series', 'anime'],
         idPrefixes: ['tt', 'kitsu'],
         catalogs: [
             {
                 type: 'movie',
-                id: 'torbox_ptbr_movies',
-                name: 'Filmes em Alta (PT-BR)',
-                extra: [{ name: 'search', isRequired: false }, { name: 'skip', isRequired: false }]
+                id: 'ptbr_rec_movies',
+                name: 'Recomendados para Você',
+                extra: [
+                    { name: 'genre', isRequired: false, options: GENRE_OPTIONS },
+                    { name: 'search', isRequired: false },
+                    { name: 'skip', isRequired: false }
+                ]
             },
             {
                 type: 'series',
-                id: 'torbox_ptbr_series',
-                name: 'Séries em Alta (PT-BR)',
-                extra: [{ name: 'search', isRequired: false }, { name: 'skip', isRequired: false }]
+                id: 'ptbr_rec_series',
+                name: 'Recomendados para Você',
+                extra: [
+                    { name: 'genre', isRequired: false, options: GENRE_OPTIONS },
+                    { name: 'search', isRequired: false },
+                    { name: 'skip', isRequired: false }
+                ]
+            },
+            {
+                type: 'movie',
+                id: 'ptbr_continue_movies',
+                name: 'Continue Assistindo',
+                extra: [{ name: 'skip', isRequired: false }]
+            },
+            {
+                type: 'series',
+                id: 'ptbr_continue_series',
+                name: 'Continue Assistindo',
+                extra: [{ name: 'skip', isRequired: false }]
+            },
+            {
+                type: 'movie',
+                id: 'ptbr_top_movies',
+                name: 'Melhores Avaliados (IMDb)',
+                extra: [
+                    { name: 'genre', isRequired: false, options: GENRE_OPTIONS },
+                    { name: 'skip', isRequired: false }
+                ]
+            },
+            {
+                type: 'series',
+                id: 'ptbr_top_series',
+                name: 'Melhores Avaliados (IMDb)',
+                extra: [
+                    { name: 'genre', isRequired: false, options: GENRE_OPTIONS },
+                    { name: 'skip', isRequired: false }
+                ]
             },
             {
                 type: 'anime',
-                id: 'torbox_ptbr_animes',
-                name: 'Animes Populares (PT-BR)',
-                extra: [{ name: 'search', isRequired: false }, { name: 'skip', isRequired: false }]
+                id: 'ptbr_rec_animes',
+                name: 'Animes Recomendados para Você',
+                extra: [
+                    { name: 'search', isRequired: false },
+                    { name: 'skip', isRequired: false }
+                ]
             }
         ],
         behaviorHints: {
@@ -109,15 +193,12 @@ function isPtBrStream(text, onlyDubbed = false, isNativePtBrSource = false) {
 // =========================================================
 
 function parseAndFormatStream(rawTitle = '', season = null) {
-    // 1. Extrai Seeds para ordenação interna
     const seedsMatch = rawTitle.match(/👤\s*(\d+)/);
     const seeds = seedsMatch ? parseInt(seedsMatch[1], 10) : 0;
 
-    // 2. Extrai Tamanho (ex: 438.22 MB ou 1.45 GB)
     const sizeMatch = rawTitle.match(/(?:💾\s*)?(\d+(?:[.,]\d+)?\s*(?:GB|MB|GiB|MiB))/i);
     const sizeText = sizeMatch ? sizeMatch[1].toUpperCase().replace('GIB', 'GB').replace('MIB', 'MB') : 'Tamanho N/D';
 
-    // 3. Verifica se o pacote corresponde à temporada certa
     let wrongSeasonPenalty = 0;
     const firstLine = rawTitle.split('\n')[0] || '';
     if (season !== null) {
@@ -130,7 +211,6 @@ function parseAndFormatStream(rawTitle = '', season = null) {
         }
     }
 
-    // 4. Detecta Resolução (4K, 1080p, 720p, 480p)
     let resolution = 'HD';
     let score = 150;
     if (/\b(2160p|4k|uhd)\b/i.test(rawTitle)) {
@@ -147,12 +227,10 @@ function parseAndFormatStream(rawTitle = '', season = null) {
         score = 100;
     }
 
-    // 5. Detecta Áudio (Dublado vs Legendado)
     const isDubOrDual = /(\bdublado\b|\bdub\b|\bdual[-_. ]?audio\b|\bdual\b|\bnacional\b)/i.test(rawTitle);
     const audioLabel = isDubOrDual ? 'Dublado' : 'Legendado';
     if (isDubOrDual) score += 50;
 
-    // 6. Extrai Qualidade (ex: BDRip BluRay, WEB-DL, HDTV, etc.)
     const qualityTokens = [];
     const tokenMap = [
         { regex: /\bbdrip\b/i, label: 'BDRip' },
@@ -175,7 +253,6 @@ function parseAndFormatStream(rawTitle = '', season = null) {
     }
 
     const qualityText = qualityTokens.length > 0 ? qualityTokens.join(' ') : 'WEB-DL';
-
     score += Math.min(seeds, 40) + wrongSeasonPenalty;
 
     const formattedDescription = `🎞️ • ${qualityText}\n📦 • ${sizeText}`;
@@ -197,6 +274,10 @@ function extractInfoHash(streamObj) {
     return match ? match[1].toLowerCase() : null;
 }
 
+// =========================================================
+// MOTOR DE CATÁLOGOS (RECOMENDADOS, CONTINUE ASSISTINDO, ANIMES)
+// =========================================================
+
 async function fetchAnimesCatalog(searchQuery = '', skip = 0) {
     try {
         const params = { 'page[limit]': 20, 'page[offset]': skip };
@@ -213,6 +294,7 @@ async function fetchAnimesCatalog(searchQuery = '', skip = 0) {
                 type: 'anime',
                 name: attr.titles?.pt_br || attr.titles?.en || attr.canonicalTitle || 'Anime',
                 poster: attr.posterImage?.medium || attr.posterImage?.original || '',
+                background: attr.coverImage?.original || attr.posterImage?.original || '',
                 description: attr.synopsis || '',
                 releaseInfo: attr.startDate ? attr.startDate.split('-')[0] : ''
             };
@@ -222,16 +304,74 @@ async function fetchAnimesCatalog(searchQuery = '', skip = 0) {
     }
 }
 
-async function fetchMoviesOrSeriesCatalog(type, searchQuery = '', skip = 0, tmdbKey = '') {
+// Carrega os episódios e detalhes quando o usuário clica num Anime do catálogo
+async function fetchAnimeMeta(kitsuId) {
     try {
-        const baseUrl = searchQuery
-            ? `https://v3-cinemeta.strem.io/catalog/${type}/top/search=${encodeURIComponent(searchQuery)}.json`
-            : `https://v3-cinemeta.strem.io/catalog/${type}/top/skip=${skip}.json`;
+        const [animeRes, epRes] = await Promise.all([
+            axios.get(`https://kitsu.io/api/edge/anime/${kitsuId}`, { timeout: 6000 }),
+            axios.get(`https://kitsu.io/api/edge/anime/${kitsuId}/episodes?page[limit]=20&sort=number`, { timeout: 6000 })
+        ]);
 
-        const res = await axios.get(baseUrl, { timeout: 7000 });
-        const metas = (res.data?.metas || []).slice(0, 20);
+        const attr = animeRes.data?.data?.attributes || {};
+        const episodes = epRes.data?.data || [];
 
-        if (tmdbKey) {
+        const videos = episodes.map((ep, idx) => {
+            const epAttr = ep.attributes || {};
+            const epNum = epAttr.number || (idx + 1);
+            return {
+                id: `kitsu:${kitsuId}:${epNum}`,
+                title: epAttr.canonicalTitle || `Episódio ${epNum}`,
+                season: 1,
+                episode: epNum,
+                released: epAttr.airdate ? new Date(epAttr.airdate).toISOString() : new Date().toISOString(),
+                thumbnail: epAttr.thumbnail?.original || attr.posterImage?.medium || ''
+            };
+        });
+
+        return {
+            id: `kitsu:${kitsuId}`,
+            type: 'anime',
+            name: attr.titles?.pt_br || attr.titles?.en || attr.canonicalTitle || 'Anime',
+            poster: attr.posterImage?.large || attr.posterImage?.original || '',
+            background: attr.coverImage?.original || attr.posterImage?.original || '',
+            description: attr.synopsis || '',
+            releaseInfo: attr.startDate ? attr.startDate.split('-')[0] : '',
+            imdbRating: attr.averageRating ? (parseFloat(attr.averageRating) / 10).toFixed(1) : undefined,
+            videos
+        };
+    } catch {
+        return null;
+    }
+}
+
+async function fetchMoviesOrSeriesCatalog(type, catalogId, extraObj = {}, tmdbKey = '') {
+    try {
+        // Se for a fileira "Continue Assistindo"
+        if (catalogId.includes('continue')) {
+            const saved = recentlyWatched[type] || [];
+            if (saved.length > 0) return saved;
+            // Se o usuário ainda não assistiu nada na sessão, exibe sugestões em alta para a fileira não ficar vazia
+        }
+
+        // Define se usa o feed de Populares (top) ou Melhores Avaliados (imdbRating)
+        const feedType = catalogId.includes('top') ? 'imdbRating' : 'top';
+
+        // Monta os filtros extras sem enviar "skip=0" (que causava erro 404 no Cinemeta)
+        const extraParts = [];
+        if (extraObj.search) extraParts.push(`search=${encodeURIComponent(extraObj.search)}`);
+        if (extraObj.genre) extraParts.push(`genre=${encodeURIComponent(extraObj.genre)}`);
+        if (extraObj.skip && parseInt(extraObj.skip, 10) > 0) {
+            extraParts.push(`skip=${parseInt(extraObj.skip, 10)}`);
+        }
+
+        const extraSuffix = extraParts.length > 0 ? `/${extraParts.join('&')}.json` : '.json';
+        const url = `https://v3-cinemeta.strem.io/catalog/${type}/${feedType}${extraSuffix}`;
+
+        const res = await axios.get(url, { timeout: 7500 });
+        const metas = (res.data?.metas || []).slice(0, 24);
+
+        // Se o usuário preencheu a chave opcional do TMDB, traduz títulos, capas e sinopses para PT-BR
+        if (tmdbKey && metas.length > 0) {
             return await Promise.all(
                 metas.map(async (meta) => {
                     try {
@@ -240,7 +380,7 @@ async function fetchMoviesOrSeriesCatalog(type, searchQuery = '', skip = 0, tmdb
                             `https://api.themoviedb.org/3/find/${imdbId}`,
                             {
                                 params: { api_key: tmdbKey, external_source: 'imdb_id', language: 'pt-BR' },
-                                timeout: 4000
+                                timeout: 3500
                             }
                         );
                         const match = type === 'movie'
@@ -260,8 +400,10 @@ async function fetchMoviesOrSeriesCatalog(type, searchQuery = '', skip = 0, tmdb
                 })
             );
         }
+
         return metas;
-    } catch {
+    } catch (err) {
+        console.error('Erro ao buscar catálogo:', err.message);
         return [];
     }
 }
@@ -273,16 +415,26 @@ async function getMediaMetadata(type, idPrefix, rawId) {
             const res = await axios.get(`https://kitsu.io/api/edge/anime/${kitsuId}`, { timeout: 5000 });
             const attrs = res.data?.data?.attributes;
             return {
+                id: `kitsu:${kitsuId}`,
+                name: attrs?.canonicalTitle || attrs?.titles?.en_jp || '',
                 title: attrs?.canonicalTitle || attrs?.titles?.en_jp || '',
+                poster: attrs?.posterImage?.medium || '',
                 year: attrs?.startDate ? attrs.startDate.split('-')[0] : ''
             };
         } else {
             const imdbId = rawId.split(':')[0];
             const metaType = type === 'movie' ? 'movie' : 'series';
             const res = await axios.get(`https://v3-cinemeta.strem.io/meta/${metaType}/${imdbId}.json`, { timeout: 5000 });
+            const meta = res.data?.meta || {};
             return {
-                title: res.data?.meta?.name || '',
-                year: res.data?.meta?.releaseInfo?.split('–')[0] || ''
+                id: imdbId,
+                name: meta.name || '',
+                title: meta.name || '',
+                poster: meta.poster || `https://images.metahub.space/poster/medium/${imdbId}/img`,
+                background: meta.background || `https://images.metahub.space/background/medium/${imdbId}/img`,
+                description: meta.description || '',
+                releaseInfo: meta.releaseInfo || '',
+                year: meta.releaseInfo?.split('–')[0] || ''
             };
         }
     } catch {
@@ -423,7 +575,7 @@ app.get(['/', '/configure', '/:config/configure'], (req, res) => {
     <html lang="pt-BR">
     <head>
         <meta charset="UTF-8">
-        <title>Stremio PT-BR Pro 2.5.1</title>
+        <title>Stremio PT-BR Pro 3.0</title>
         <style>
             body { font-family: system-ui, sans-serif; background: #0f172a; color: #f8fafc; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 1rem; }
             .card { background: #1e293b; padding: 2rem; border-radius: 12px; width: 100%; max-width: 500px; box-shadow: 0 10px 25px rgba(0,0,0,0.4); }
@@ -444,11 +596,11 @@ app.get(['/', '/configure', '/:config/configure'], (req, res) => {
     </head>
     <body>
         <div class="card">
-            <h2>🎬 Stremio PT-BR Pro 2.5.1</h2>
+            <h2>🎬 Stremio PT-BR Pro 3.0</h2>
             <div class="badges">
-                <span class="badge">Layout Personalizado</span>
+                <span class="badge">Recomendados para Você</span>
+                <span class="badge">Continue Assistindo</span>
                 <span class="badge">🧲 P2P & ⚡ TorBox</span>
-                <span class="badge">4K / 1080p / 720p</span>
             </div>
             
             <label>Como você deseja assistir?</label>
@@ -537,26 +689,28 @@ app.get(['/manifest.json', '/:config/manifest.json', '/*/manifest.json'], (req, 
     res.json(buildManifest(config));
 });
 
+// Rota de Catálogo (Recomendados para Você, Continue Assistindo, Melhores Avaliados, Animes)
 async function handleCatalogRequest(req, res) {
-    const { config: configStr, type, extra } = req.params;
+    const { config: configStr, type, id: catalogId, extra } = req.params;
     const config = decodeConfig(configStr);
 
-    let searchQuery = '';
-    let skip = 0;
-
+    const extraObj = {};
     if (extra) {
-        const searchMatch = extra.match(/search=([^&]+)/);
-        const skipMatch = extra.match(/skip=(\d+)/);
-        if (searchMatch) searchQuery = decodeURIComponent(searchMatch[1]);
-        if (skipMatch) skip = parseInt(skipMatch[1], 10);
+        const pairs = extra.split('&');
+        for (const pair of pairs) {
+            const [k, v] = pair.split('=');
+            if (k && v !== undefined) {
+                extraObj[k] = decodeURIComponent(v);
+            }
+        }
     }
 
-    if (type === 'anime') {
-        const metas = await fetchAnimesCatalog(searchQuery, skip);
+    if (type === 'anime' || catalogId.includes('anime')) {
+        const metas = await fetchAnimesCatalog(extraObj.search || '', parseInt(extraObj.skip || '0', 10));
         return res.json({ metas });
     }
 
-    const metas = await fetchMoviesOrSeriesCatalog(type, searchQuery, skip, config.tmdbKey);
+    const metas = await fetchMoviesOrSeriesCatalog(type, catalogId, extraObj, config.tmdbKey);
     res.json({ metas });
 }
 
@@ -567,6 +721,21 @@ app.get([
     '/:config/catalog/:type/:id/:extra.json'
 ], handleCatalogRequest);
 
+// Rota de Metadados para Animes (abre temporadas/episódios ao clicar na capa do Anime)
+app.get([
+    '/meta/:type/:id.json',
+    '/:config/meta/:type/:id.json'
+], async (req, res) => {
+    const { id } = req.params;
+    if (id.startsWith('kitsu:')) {
+        const kitsuId = id.split(':')[1];
+        const meta = await fetchAnimeMeta(kitsuId);
+        if (meta) return res.json({ meta });
+    }
+    res.json({ meta: null });
+});
+
+// Rota de Streams + Registro automático no "Continue Assistindo"
 async function handleStreamRequest(req, res) {
     const { config: configStr, type, id } = req.params;
     const config = decodeConfig(configStr);
@@ -589,6 +758,12 @@ async function handleStreamRequest(req, res) {
     }
 
     const metadata = await getMediaMetadata(type, idPrefix, id);
+
+    // Salva automaticamente o filme/série na fileira "Continue Assistindo"
+    if (idPrefix === 'tt' && metadata.name) {
+        addToContinueWatching(type, metadata);
+    }
+
     const activeApiKey = (mode === 'torbox' || mode === 'hybrid') ? config.apiKey : '';
 
     const candidates = await fetchCandidateTorrents(
@@ -606,7 +781,7 @@ async function handleStreamRequest(req, res) {
 
     const scoredStreams = [];
 
-    // 1. Quando ativar o TorBox: ⚡ • 1080p - Dublado
+    // 1. TorBox: ⚡ • 1080p - Dublado
     if ((mode === 'torbox' || mode === 'hybrid') && activeApiKey) {
         const hashes = candidates.map(c => c.infoHash);
         const cachedMap = await checkTorBoxCache(activeApiKey, hashes);
@@ -633,7 +808,7 @@ async function handleStreamRequest(req, res) {
         }
     }
 
-    // 2. Quando ativar o P2P: 🧲 • 1080p - Dublado (Apenas o ímã, sem o texto P2P)
+    // 2. P2P: 🧲 • 1080p - Dublado
     if (mode === 'p2p' || mode === 'hybrid' || !activeApiKey) {
         for (const c of candidates) {
             const info = parseAndFormatStream(c.title, season);
