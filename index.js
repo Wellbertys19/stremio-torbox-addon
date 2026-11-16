@@ -16,10 +16,11 @@ const PORT = process.env.PORT || 7000;
 const TORBOX_API = 'https://api.torbox.app/v1/api';
 
 // =========================================================
-// TRADUTOR AUTOMÁTICO PT-BR COM CACHE EM MEMÓRIA
+// MOTOR DE TRADUÇÃO EM LOTE (SINOPSES + TODOS OS EPISÓDIOS)
 // =========================================================
 
 const translationCache = new Map();
+const metaTranslationCache = new Map();
 
 const GENRE_TRANSLATIONS = {
     'Action': 'Ação',
@@ -53,38 +54,108 @@ function translateGenresToPtBr(genres = []) {
     return genres.map(g => GENRE_TRANSLATIONS[g] || g);
 }
 
+// Traduz um único texto para PT-BR
 async function translateToPtBr(text) {
     if (!text || typeof text !== 'string') return '';
-    const cleanText = text.replace(/\s*\[Written by [^\]]+\]\s*/gi, '').trim();
+    const cleanText = text.replace(/\s*\[Written by [^\]]+\]\s*/gi, '').replace(/[\r\n]+/g, ' ').trim();
     if (!cleanText) return '';
 
     if (translationCache.has(cleanText)) {
         return translationCache.get(cleanText);
     }
 
-    try {
-        const res = await axios.get('https://translate.googleapis.com/translate_a/single', {
-            params: {
-                client: 'gtx',
-                sl: 'auto',
-                tl: 'pt',
-                dt: 't',
-                q: cleanText
-            },
-            timeout: 4000
-        });
+    const [translated] = await translateBatchToPtBr([cleanText]);
+    return translated || cleanText;
+}
 
-        if (Array.isArray(res.data?.[0])) {
-            const translated = res.data[0].map(part => part[0]).join('');
-            if (translated) {
-                if (translationCache.size > 2000) translationCache.clear();
-                translationCache.set(cleanText, translated);
-                return translated;
-            }
+// Traduz dezenas de sinopses e títulos de episódios de uma só vez em blocos rápidos
+async function translateBatchToPtBr(texts = []) {
+    if (!Array.isArray(texts) || texts.length === 0) return [];
+
+    const results = new Array(texts.length).fill('');
+    const missingIndices = [];
+    const missingTexts = [];
+
+    for (let i = 0; i < texts.length; i++) {
+        const raw = typeof texts[i] === 'string' ? texts[i] : '';
+        const cleaned = raw.replace(/\s*\[Written by [^\]]+\]\s*/gi, '').replace(/[\r\n]+/g, ' ').trim();
+        if (!cleaned) {
+            results[i] = '';
+        } else if (translationCache.has(cleaned)) {
+            results[i] = translationCache.get(cleaned);
+        } else {
+            missingIndices.push(i);
+            missingTexts.push(cleaned);
         }
-    } catch {}
+    }
 
-    return cleanText;
+    if (missingTexts.length === 0) return results;
+
+    // Agrupa textos em blocos de até 3200 caracteres (1 linha = 1 episódio)
+    const chunks = [];
+    let currentChunkTexts = [];
+    let currentChunkIndices = [];
+    let currentLen = 0;
+
+    for (let i = 0; i < missingTexts.length; i++) {
+        const t = missingTexts[i];
+        const idx = missingIndices[i];
+        if (currentLen + t.length > 3200 && currentChunkTexts.length > 0) {
+            chunks.push({ texts: currentChunkTexts, indices: currentChunkIndices });
+            currentChunkTexts = [];
+            currentChunkIndices = [];
+            currentLen = 0;
+        }
+        currentChunkTexts.push(t);
+        currentChunkIndices.push(idx);
+        currentLen += t.length + 1;
+    }
+
+    if (currentChunkTexts.length > 0) {
+        chunks.push({ texts: currentChunkTexts, indices: currentChunkIndices });
+    }
+
+    await Promise.all(
+        chunks.map(async (chunk) => {
+            const joinedPayload = chunk.texts.join('\n');
+            try {
+                const body = new URLSearchParams({ q: joinedPayload }).toString();
+                const res = await axios.post(
+                    'https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=pt&dt=t',
+                    body,
+                    {
+                        headers: {
+                            'Content-Type': 'application/x-www-form-urlencoded',
+                            'User-Agent': 'Mozilla/5.0'
+                        },
+                        timeout: 6000
+                    }
+                );
+
+                if (Array.isArray(res.data?.[0])) {
+                    const fullTranslated = res.data[0].map(part => part[0]).join('');
+                    const translatedLines = fullTranslated.split('\n');
+
+                    for (let j = 0; j < chunk.texts.length; j++) {
+                        const original = chunk.texts[j];
+                        const targetIdx = chunk.indices[j];
+                        const finalStr = (translatedLines[j] || original).trim();
+                        if (translationCache.size > 5000) translationCache.clear();
+                        translationCache.set(original, finalStr);
+                        results[targetIdx] = finalStr;
+                    }
+                    return;
+                }
+            } catch {}
+
+            // Fallback se falhar a rede
+            for (let j = 0; j < chunk.texts.length; j++) {
+                results[chunk.indices[j]] = chunk.texts[j];
+            }
+        })
+    );
+
+    return results;
 }
 
 // =========================================================
@@ -177,9 +248,9 @@ function buildManifest(config = {}) {
 
     return {
         id: 'org.community.torbox.ptbr.pro',
-        version: '3.2.0',
+        version: '3.3.0',
         name: addonName,
-        description: 'Catálogos, Sinopses em Português (Filmes, Séries e Animes) e Streams em PT-BR com TorBox e P2P.',
+        description: 'Catálogos, Episódios e Sinopses 100% em Português (Filmes, Séries e Animes) com TorBox e P2P.',
         resources: ['catalog', 'meta', 'stream'],
         types: ['movie', 'series', 'anime'],
         idPrefixes: ['tt', 'kitsu'],
@@ -347,7 +418,7 @@ function extractInfoHash(streamObj) {
 }
 
 // =========================================================
-// CATÁLOGOS E METADADOS COM SINOPSES 100% EM PORTUGUÊS
+// CATÁLOGOS E METADADOS (SINOPSES + TEMPORADAS + EPISÓDIOS EM PT-BR)
 // =========================================================
 
 async function fetchAnimesCatalog(searchQuery = '', skip = 0) {
@@ -359,28 +430,33 @@ async function fetchAnimesCatalog(searchQuery = '', skip = 0) {
         const res = await axios.get('https://kitsu.io/api/edge/anime', { params, timeout: 7000 });
         const items = res.data?.data || [];
 
-        return await Promise.all(
-            items.map(async (item) => {
-                const attr = item.attributes || {};
-                const ptSynopsis = await translateToPtBr(attr.synopsis || '');
-                return {
-                    id: `kitsu:${item.id}`,
-                    type: 'anime',
-                    name: attr.titles?.pt_br || attr.titles?.en || attr.canonicalTitle || 'Anime',
-                    poster: attr.posterImage?.medium || attr.posterImage?.original || '',
-                    background: attr.coverImage?.original || attr.posterImage?.original || '',
-                    description: ptSynopsis,
-                    releaseInfo: attr.startDate ? attr.startDate.split('-')[0] : ''
-                };
-            })
-        );
+        const synopses = items.map(item => item.attributes?.synopsis || '');
+        const translatedSynopses = await translateBatchToPtBr(synopses);
+
+        return items.map((item, idx) => {
+            const attr = item.attributes || {};
+            return {
+                id: `kitsu:${item.id}`,
+                type: 'anime',
+                name: attr.titles?.pt_br || attr.titles?.en || attr.canonicalTitle || 'Anime',
+                poster: attr.posterImage?.medium || attr.posterImage?.original || '',
+                background: attr.coverImage?.original || attr.posterImage?.original || '',
+                description: translatedSynopses[idx] || attr.synopsis || '',
+                releaseInfo: attr.startDate ? attr.startDate.split('-')[0] : ''
+            };
+        });
     } catch {
         return [];
     }
 }
 
-// Metadados completos de Animes com sinopse e episódios em Português
+// Metadados completos de Animes com sinopses e títulos de episódios traduzidos
 async function fetchAnimeMeta(kitsuId, requestedType = 'anime') {
+    const cacheKey = `kitsu:${kitsuId}:${requestedType}`;
+    if (metaTranslationCache.has(cacheKey)) {
+        return metaTranslationCache.get(cacheKey);
+    }
+
     try {
         const [animeRes, epRes] = await Promise.all([
             axios.get(`https://kitsu.io/api/edge/anime/${kitsuId}`, { timeout: 6000 }),
@@ -390,17 +466,32 @@ async function fetchAnimeMeta(kitsuId, requestedType = 'anime') {
         const attr = animeRes.data?.data?.attributes || {};
         const episodes = epRes.data?.data || [];
 
-        const ptSynopsis = await translateToPtBr(attr.synopsis || '');
+        // Prepara lote de tradução: [sinopse principal, títulos dos episódios..., sinopses dos episódios...]
+        const epTitles = episodes.map(ep => ep.attributes?.canonicalTitle || '');
+        const epSynopses = episodes.map(ep => ep.attributes?.synopsis || ep.attributes?.description || '');
+
+        const [ptMainSynopsis, ...restTranslated] = await translateBatchToPtBr([
+            attr.synopsis || '',
+            ...epTitles,
+            ...epSynopses
+        ]);
+
+        const translatedEpTitles = restTranslated.slice(0, episodes.length);
+        const translatedEpSynopses = restTranslated.slice(episodes.length);
 
         const videos = episodes.map((ep, idx) => {
             const epAttr = ep.attributes || {};
             const epNum = epAttr.number || (idx + 1);
+            const tTitle = translatedEpTitles[idx] || `Episódio ${epNum}`;
+            const tOverview = translatedEpSynopses[idx] || ptMainSynopsis;
             return {
                 id: `kitsu:${kitsuId}:${epNum}`,
-                title: `Episódio ${epNum}${epAttr.canonicalTitle ? ` - ${epAttr.canonicalTitle}` : ''}`,
+                title: tTitle,
+                name: tTitle,
                 season: 1,
                 episode: epNum,
-                overview: ptSynopsis,
+                overview: tOverview,
+                description: tOverview,
                 released: epAttr.airdate ? new Date(epAttr.airdate).toISOString() : new Date().toISOString(),
                 thumbnail: epAttr.thumbnail?.original || attr.posterImage?.medium || ''
             };
@@ -410,33 +501,44 @@ async function fetchAnimeMeta(kitsuId, requestedType = 'anime') {
             videos.push({
                 id: `kitsu:${kitsuId}:1`,
                 title: 'Episódio 1',
+                name: 'Episódio 1',
                 season: 1,
                 episode: 1,
-                overview: ptSynopsis,
+                overview: ptMainSynopsis,
+                description: ptMainSynopsis,
                 released: new Date().toISOString()
             });
         }
 
-        return {
+        const resultMeta = {
             id: `kitsu:${kitsuId}`,
             type: requestedType,
             name: attr.titles?.pt_br || attr.titles?.en || attr.canonicalTitle || 'Anime',
             poster: attr.posterImage?.large || attr.posterImage?.original || '',
             background: attr.coverImage?.original || attr.posterImage?.original || '',
-            description: ptSynopsis,
+            description: ptMainSynopsis,
             releaseInfo: attr.startDate ? attr.startDate.split('-')[0] : '',
             imdbRating: attr.averageRating ? (parseFloat(attr.averageRating) / 10).toFixed(1) : undefined,
             videos
         };
+
+        if (metaTranslationCache.size > 300) metaTranslationCache.clear();
+        metaTranslationCache.set(cacheKey, resultMeta);
+        return resultMeta;
     } catch {
         return null;
     }
 }
 
-// Metadados completos de Filmes e Séries (IMDb) traduzidos para PT-BR
+// Metadados completos de Filmes e Séries (IMDb) + Tradução de TODOS os Episódios das Temporadas
 async function fetchImdbMeta(type, imdbId, tmdbKey = '') {
     const cleanId = imdbId.split(':')[0];
     const metaType = type === 'movie' ? 'movie' : 'series';
+    const cacheKey = `${metaType}:${cleanId}:${Boolean(tmdbKey)}`;
+
+    if (metaTranslationCache.has(cacheKey)) {
+        return metaTranslationCache.get(cacheKey);
+    }
 
     try {
         const res = await axios.get(`https://v3-cinemeta.strem.io/meta/${metaType}/${cleanId}.json`, { timeout: 7500 });
@@ -446,7 +548,7 @@ async function fetchImdbMeta(type, imdbId, tmdbKey = '') {
 
         let isTranslatedByTmdb = false;
 
-        // 1. Se tiver TMDB Key configurada, tenta buscar título, capa e sinopse oficial PT-BR
+        // 1. Se tiver TMDB Key configurada, busca título, capa e sinopse oficial PT-BR
         if (tmdbKey) {
             try {
                 const findRes = await axios.get(
@@ -472,19 +574,46 @@ async function fetchImdbMeta(type, imdbId, tmdbKey = '') {
             } catch {}
         }
 
-        // 2. Se não usou TMDB (ou se o TMDB não tinha sinopse em português), traduz automaticamente!
-        if (!isTranslatedByTmdb && meta.description) {
-            meta.description = await translateToPtBr(meta.description);
+        // 2. Traduz a sinopse principal + TODOS os títulos e resumos de episódios (meta.videos) em lote!
+        const videos = Array.isArray(meta.videos) ? meta.videos : [];
+        const videoTitles = videos.map(v => v.name || v.title || '');
+        const videoOverviews = videos.map(v => v.overview || v.description || '');
+
+        const batchInput = [
+            isTranslatedByTmdb ? '' : (meta.description || ''),
+            ...videoTitles,
+            ...videoOverviews
+        ];
+
+        const batchOutput = await translateBatchToPtBr(batchInput);
+
+        if (!isTranslatedByTmdb && batchOutput[0]) {
+            meta.description = batchOutput[0];
         }
 
-        // 3. Traduz os gêneros (Action -> Ação, Horror -> Terror, etc.)
-        if (meta.genres) {
-            meta.genres = translateGenresToPtBr(meta.genres);
-        }
-        if (meta.genre) {
-            meta.genre = translateGenresToPtBr(meta.genre);
+        const translatedTitles = batchOutput.slice(1, 1 + videos.length);
+        const translatedOverviews = batchOutput.slice(1 + videos.length);
+
+        if (videos.length > 0) {
+            meta.videos = videos.map((v, idx) => {
+                const ptTitle = translatedTitles[idx] || v.name || v.title || `Episódio ${v.episode || idx + 1}`;
+                const ptOverview = translatedOverviews[idx] || v.overview || v.description || '';
+                return {
+                    ...v,
+                    name: ptTitle,
+                    title: ptTitle,
+                    overview: ptOverview,
+                    description: ptOverview
+                };
+            });
         }
 
+        // 3. Traduz os géneros
+        if (meta.genres) meta.genres = translateGenresToPtBr(meta.genres);
+        if (meta.genre) meta.genre = translateGenresToPtBr(meta.genre);
+
+        if (metaTranslationCache.size > 300) metaTranslationCache.clear();
+        metaTranslationCache.set(cacheKey, meta);
         return meta;
     } catch {
         return {
@@ -519,48 +648,15 @@ async function fetchMoviesOrSeriesCatalog(type, catalogId, extraObj = {}, tmdbKe
         const res = await axios.get(url, { timeout: 7500 });
         const metas = (res.data?.metas || []).slice(0, 20);
 
-        // Traduz sinopses e gêneros de todos os itens do catálogo para PT-BR em paralelo
-        return await Promise.all(
-            metas.map(async (meta) => {
-                let updatedMeta = { ...meta };
-                let translatedByTmdb = false;
+        const descriptions = metas.map(m => m.description || '');
+        const translatedDescriptions = await translateBatchToPtBr(descriptions);
 
-                if (tmdbKey) {
-                    try {
-                        const imdbId = meta.id.split(':')[0];
-                        const findRes = await axios.get(
-                            `https://api.themoviedb.org/3/find/${imdbId}`,
-                            {
-                                params: { api_key: tmdbKey, external_source: 'imdb_id', language: 'pt-BR' },
-                                timeout: 3000
-                            }
-                        );
-                        const match = type === 'movie'
-                            ? findRes.data?.movie_results?.[0]
-                            : findRes.data?.tv_results?.[0];
-
-                        if (match) {
-                            updatedMeta.name = match.title || match.name || meta.name;
-                            if (match.poster_path) updatedMeta.poster = `https://image.tmdb.org/t/p/w500${match.poster_path}`;
-                            if (match.overview) {
-                                updatedMeta.description = match.overview;
-                                translatedByTmdb = true;
-                            }
-                        }
-                    } catch {}
-                }
-
-                if (!translatedByTmdb && updatedMeta.description) {
-                    updatedMeta.description = await translateToPtBr(updatedMeta.description);
-                }
-
-                if (updatedMeta.genres) {
-                    updatedMeta.genres = translateGenresToPtBr(updatedMeta.genres);
-                }
-
-                return updatedMeta;
-            })
-        );
+        return metas.map((meta, idx) => ({
+            ...meta,
+            description: translatedDescriptions[idx] || meta.description || '',
+            genres: meta.genres ? translateGenresToPtBr(meta.genres) : undefined,
+            genre: meta.genre ? translateGenresToPtBr(meta.genre) : undefined
+        }));
     } catch (err) {
         console.error('Erro ao buscar catálogo:', err.message);
         return [];
@@ -735,7 +831,7 @@ app.get(['/', '/configure', '/:config/configure'], (req, res) => {
     <html lang="pt-BR">
     <head>
         <meta charset="UTF-8">
-        <title>Stremio PT-BR Pro 3.2</title>
+        <title>Stremio PT-BR Pro 3.3</title>
         <style>
             body { font-family: system-ui, sans-serif; background: #0f172a; color: #f8fafc; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 1rem; }
             .card { background: #1e293b; padding: 2rem; border-radius: 12px; width: 100%; max-width: 500px; box-shadow: 0 10px 25px rgba(0,0,0,0.4); }
@@ -756,9 +852,9 @@ app.get(['/', '/configure', '/:config/configure'], (req, res) => {
     </head>
     <body>
         <div class="card">
-            <h2>🎬 Stremio PT-BR Pro 3.2</h2>
+            <h2>🎬 Stremio PT-BR Pro 3.3</h2>
             <div class="badges">
-                <span class="badge">Sinopses 100% PT-BR</span>
+                <span class="badge">Episódios & Sinopses PT-BR</span>
                 <span class="badge">Recomendados & Continue Assistindo</span>
                 <span class="badge">🧲 P2P & ⚡ TorBox</span>
             </div>
@@ -780,8 +876,8 @@ app.get(['/', '/configure', '/:config/configure'], (req, res) => {
                 </label>
             </div>
             
-            <label>TMDB API Key (Opcional - Sinopses já são traduzidas automaticamente):</label>
-            <input type="text" id="tmdbKey" placeholder="Opcional: tradução automática PT-BR já está ativa!" oninput="updateLinks()" />
+            <label>TMDB API Key (Opcional - Tradução automática já ativa):</label>
+            <input type="text" id="tmdbKey" placeholder="Opcional: episódios e sinopses já são traduzidos!" oninput="updateLinks()" />
 
             <label>Indexadores Extras Opcionais (separados por vírgula):</label>
             <input type="text" id="customIndexers" placeholder="Opcional: Torrentio, Brazuca e MediaFusion já inclusos" oninput="updateLinks()" />
@@ -881,7 +977,7 @@ app.get([
     '/:config/catalog/:type/:id/:extra.json'
 ], handleCatalogRequest);
 
-// Rota Completa de Metadados com Tradução PT-BR Automática
+// Rota Completa de Metadados (Traduz Sinopse Principal + Todos os Episódios em Lote)
 async function handleMetaRequest(req, res) {
     const { config: configStr, type } = req.params;
     const rawId = decodeURIComponent(req.params.id || '');
